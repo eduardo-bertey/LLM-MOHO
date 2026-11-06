@@ -115,9 +115,9 @@ def main():
     for p in (g, u, d):
         p.requires_grad_(True)
 
-    opt = torch.optim.Adam([g, u, d], lr=LR)
+    opt = torch.optim.AdamW([g, u, d], lr=LR, weight_decay=0.01)
     print(f"[train] {STEPS} pasos | batch {BATCH} seq {SEQ} "
-          f"({BATCH * SEQ} tokens) | lr {LR} | MSE")
+          f"({BATCH * SEQ} tokens) | lr {LR} | AdamW | MSE")
     gen = torch.Generator(device=device).manual_seed(42)
     t0 = time.time()
     for step in range(1, STEPS + 1):
@@ -132,7 +132,11 @@ def main():
         opt.step()
         if step % LOG_EVERY == 0 or step == 1:
             cos = F.cosine_similarity(target.detach().ravel(), out.detach().ravel(), dim=0).item()
+            mag_ratio = out.norm().item() / max(target.norm().item(), 1e-8)
+            rel_err = (out - target).norm().item() / max(target.norm().item(), 1e-8)
+            r2 = 1 - ((out - target).pow(2).sum() / target.pow(2).sum()).item()
             print(f" step {step:5d}/{STEPS} loss {loss.detach().item():.6f} cos {cos:.4f} "
+                  f"mag_ratio {mag_ratio:.4f} rel_err {rel_err:.4f} R2 {r2:.4f} "
                   f"l2_target={target.norm().item():.1f} l2_out={out.norm().item():.1f}",
                   flush=True)
     print(f"[time] {time.time() - t0:.1f}s")
