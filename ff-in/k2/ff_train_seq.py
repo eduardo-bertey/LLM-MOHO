@@ -59,7 +59,12 @@ def eval_10_tokens(g, u, d, gw, uw, dw, step):
     model.eval()
 
     def gen10():
-        inp = tok(EVAL_PROMPT, return_tensors="pt").to(model.device)
+        # inferencia como k2/infer.py: chat template + generate
+        text = tok.apply_chat_template(
+            [{"role": "user", "content": EVAL_PROMPT}],
+            tokenize=False, add_generation_prompt=True,
+            chat_template_kwargs={"reasoning_effort": "high"})
+        inp = tok(text, return_tensors="pt").to(model.device)
         with torch.no_grad():
             out = model.generate(**inp, max_new_tokens=EVAL_TOKENS,
                                  do_sample=False, use_cache=True)
