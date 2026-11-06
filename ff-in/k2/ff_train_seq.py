@@ -1,7 +1,7 @@
 """Un solo run en Colab: descarga el rango FF de K2 y entrena FF MOHO de cero.
 
 Colab: !python ff-in/k2/ff_train_seq.py
-Sin flags por defecto: batch 8, seq 1024 (8*1024=8192 tokens), 10000 pasos,
+Sin flags por defecto: batch 128, seq 1024 (128*1024=131072 tokens), 10000 pasos,
 MSE impreso cada 10. Los pesos se guardan junto al script:
 layer0_*.weight (K2) y moho_step10k_* (entrenados). No baja el modelo
 completo: solo Range de HF.
@@ -32,7 +32,7 @@ KEYS = {
     "layer0_down_proj.weight": "model.layers.0.mlp.down_proj.weight",
 }
 
-BATCH = 8
+BATCH = 128
 SEQ = 1024
 STEPS = 10000
 LR = 1e-3
@@ -142,7 +142,7 @@ def main():
         open(os.path.join(BASE, name), "wb").write(t.detach().cpu().to(torch.bfloat16)
                                                     .contiguous().view(torch.uint8).numpy().tobytes())
         print(f"[save] {name}")
-    print("OK: entrenado en Colab (batch 8 seq 1024, 10000 pasos)")
+    print("OK: entrenado en Colab (batch 128 seq 1024, 10000 pasos)")
 
 
 if __name__ == "__main__":
