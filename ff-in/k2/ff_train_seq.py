@@ -1,7 +1,7 @@
 """Un solo run en Colab: descarga el rango FF de K2 y entrena FF MOHO de cero.
 
 Colab: !python ff-in/k2/ff_train_seq.py
-Sin flags por defecto: batch 128, seq 1024 (128*1024=131072 tokens), 10000 pasos,
+Sin flags por defecto: batch 64, seq 1024 (64*1024=65536 tokens), 10000 pasos,
 MSE impreso cada 10. Los pesos se guardan junto al script:
 layer0_*.weight (K2) y moho_step10k_* (entrenados). No baja el modelo
 completo: solo Range de HF.
@@ -32,7 +32,7 @@ KEYS = {
     "layer0_down_proj.weight": "model.layers.0.mlp.down_proj.weight",
 }
 
-BATCH = 128
+BATCH = 64
 SEQ = 1024
 STEPS = 10000
 LR = 1e-3
@@ -131,7 +131,8 @@ def main():
         loss.backward()
         opt.step()
         if step % LOG_EVERY == 0 or step == 1:
-            print(f" step {step:5d}/{STEPS} loss {loss.detach().item():.6f} "
+            cos = F.cosine_similarity(target.detach().ravel(), out.detach().ravel(), dim=0).item()
+            print(f" step {step:5d}/{STEPS} loss {loss.detach().item():.6f} cos {cos:.4f} "
                   f"l2_target={target.norm().item():.1f} l2_out={out.norm().item():.1f}",
                   flush=True)
     print(f"[time] {time.time() - t0:.1f}s")
@@ -142,7 +143,7 @@ def main():
         open(os.path.join(BASE, name), "wb").write(t.detach().cpu().to(torch.bfloat16)
                                                     .contiguous().view(torch.uint8).numpy().tobytes())
         print(f"[save] {name}")
-    print("OK: entrenado en Colab (batch 128 seq 1024, 10000 pasos)")
+    print("OK: entrenado en Colab (batch 64 seq 1024, 10000 pasos)")
 
 
 if __name__ == "__main__":
