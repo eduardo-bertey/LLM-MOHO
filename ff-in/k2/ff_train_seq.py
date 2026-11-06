@@ -1,4 +1,4 @@
-""""""
+"""
 Un solo run en Colab: descarga el rango FF de K2 y entrena FF MOHO de cero.
 Cada 500 pasos para el destil, carga K2, cambia FF0 por el destil,
 genera 10 tokens con original y con destil, compara, libera y sigue.
