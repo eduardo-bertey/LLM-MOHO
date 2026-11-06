@@ -1,0 +1,5 @@
+# Tensor dumps locales (no subir a git)
+/ff-in/
+ff-in/
+__pycache__/
+*.pyc
