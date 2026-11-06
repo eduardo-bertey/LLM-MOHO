@@ -1,10 +1,10 @@
-"""Un solo run en Colab: descarga el rango FF de K2 y entrena FF MOHO de cero.
+""""""
+Un solo run en Colab: descarga el rango FF de K2 y entrena FF MOHO de cero.
+Cada 500 pasos para el destil, carga K2, cambia FF0 por el destil,
+genera 10 tokens con original y con destil, compara, libera y sigue.
+NO toca k2/infer.py.
 
 Colab: !python ff-in/k2/ff_train_seq.py
-Sin flags por defecto: batch 64, seq 1024 (64*1024=65536 tokens), 10000 pasos,
-MSE impreso cada 10. Los pesos se guardan junto al script:
-layer0_*.weight (K2) y moho_step10k_* (entrenados). No baja el modelo
-completo: solo Range de HF.
 """
 import json
 import os
@@ -37,6 +37,62 @@ SEQ = 1024
 STEPS = 10000
 LR = 1e-3
 LOG_EVERY = 10
+EVAL_EVERY = 500
+EVAL_TOKENS = 10
+EVAL_PROMPT = "Hola, soy K2 y"
+
+
+def eval_10_tokens(g, u, d, gw, uw, dw, step):
+    """Para el destil: congela gradientes, carga K2, compara 10 tokens."""
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    # detener destil y liberar gradientes
+    for p in (g, u, d):
+        p.requires_grad_(False)
+    print(f"[eval] paso {step}: cargando K2...", flush=True)
+    tok = AutoTokenizer.from_pretrained("IFM/K2-Horizon-0.9B", trust_remote_code=True)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model = AutoModelForCausalLM.from_pretrained(
+        "IFM/K2-Horizon-0.9B", dtype=torch.bfloat16,
+        device_map="cuda:0" if device == "cuda" else "cpu",
+        trust_remote_code=True, low_cpu_mem_usage=True)
+    model.eval()
+
+    def gen10():
+        inp = tok(EVAL_PROMPT, return_tensors="pt").to(model.device)
+        with torch.no_grad():
+            out = model.generate(**inp, max_new_tokens=EVAL_TOKENS,
+                                 do_sample=False, use_cache=True)
+        ids = out[0][inp.input_ids.shape[1]:].tolist()
+        txt = tok.decode(ids, skip_special_tokens=True)
+        return ids, txt
+
+    # 1) original: FF K2 de HF
+    ids_orig, txt_orig = gen10()
+
+    # 2) destil: copiar pesos MOHO (en CPU float32 -> bf16 -> GPU del modelo)
+    mlp = model.model.layers[0].mlp
+    # el modelo K2 con trust_remote_code puede omitir prefijo model.
+    if mlp is None:
+        mlp = model.layers[0].mlp
+    pairs = ((mlp.gate_proj.weight, g), (mlp.up_proj.weight, u),
+             (mlp.down_proj.weight, d))
+    for dst, src in pairs:
+        dst.data.copy_(src.detach().cpu().to(dst.dtype))
+    ids_dist, txt_dist = gen10()
+    match = sum(a == b for a, b in zip(ids_orig, ids_dist))
+    print(f"[eval] paso {step}: match {match}/{EVAL_TOKENS}")
+    print(f"[eval] orig : {ids_orig} -> {txt_orig!r}")
+    print(f"[eval] dist : {ids_dist} -> {txt_dist!r}")
+
+    # liberar modelo y reactivar destil
+    del model, tok
+    if device == "cuda":
+        torch.cuda.empty_cache()
+    for p in (g, u, d):
+        p.requires_grad_(True)
+    print("[eval] destil reanudado", flush=True)
+    return match
 
 
 def _get_range(url, s, e):
@@ -139,6 +195,16 @@ def main():
                   f"mag_ratio {mag_ratio:.4f} rel_err {rel_err:.4f} R2 {r2:.4f} "
                   f"l2_target={target.norm().item():.1f} l2_out={out.norm().item():.1f}",
                   flush=True)
+
+        if step % EVAL_EVERY == 0:
+            try:
+                eval_10_tokens(g, u, d, gw, uw, dw, step)
+            except Exception as e:
+                print(f"[eval] ERROR {e}; sigo con destil", flush=True)
+                for p in (g, u, d):
+                    p.requires_grad_(True)
+                if device == "cuda":
+                    torch.cuda.empty_cache()
     print(f"[time] {time.time() - t0:.1f}s")
 
     for t, name in ((g, "moho_step10k_gate_proj.weight"),
