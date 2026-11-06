@@ -99,11 +99,11 @@ def main():
         print("[moho] pesos de cero en disco")
     else:
         gen = torch.Generator().manual_seed(123)
-        g = (torch.randn(5120, 1536, generator=gen) * (1 / 1536 ** 0.5)
+        g = (torch.randn(5120, 1536, generator=gen, dtype=torch.float32) * (1 / 1536 ** 0.5)
              ).to(torch.bfloat16).to(torch.float32).to(device)
-        u = (torch.randn(5120, 1536, generator=gen) * (1 / 1536 ** 0.5)
+        u = (torch.randn(5120, 1536, generator=gen, dtype=torch.float32) * (1 / 1536 ** 0.5)
              ).to(torch.bfloat16).to(torch.float32).to(device)
-        d = (torch.randn(1536, 5120, generator=gen) * (1 / 5120 ** 0.5)
+        d = (torch.randn(1536, 5120, generator=gen, dtype=torch.float32) * (1 / 5120 ** 0.5)
              ).to(torch.bfloat16).to(torch.float32).to(device)
         for t, (n, _) in zip((g, u, d), names):
             open(os.path.join(BASE, n), "wb").write(t.cpu().to(torch.bfloat16)
@@ -118,7 +118,7 @@ def main():
     opt = torch.optim.Adam([g, u, d], lr=LR)
     print(f"[train] {STEPS} pasos | batch {BATCH} seq {SEQ} "
           f"({BATCH * SEQ} tokens) | lr {LR} | MSE")
-    gen = torch.Generator().manual_seed(42)
+    gen = torch.Generator(device=device).manual_seed(42)
     t0 = time.time()
     for step in range(1, STEPS + 1):
         x = torch.randn(BATCH * SEQ, 1536, generator=gen,
