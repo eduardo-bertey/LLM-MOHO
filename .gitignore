@@ -1,5 +1,7 @@
 # Tensor dumps locales (no subir a git)
-/ff-in/
-ff-in/
+/ff-in/**/*.weight
+ff-in/**/*.weight
+ff-in/**/meta.json
+!ff-in/**/*.py
 __pycache__/
 *.pyc
