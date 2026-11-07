@@ -6,7 +6,7 @@ Uso en Colab:
     %cd LLM-MOHO/qwen-ff-local
     !python3 train_15_ff.py
 
-Regla: 1 bloque ≈ 500 k tokens de texto (≈ 488 seq x 1024). El script:
+Regla: 1 bloque >= 500 k tokens (489 seq x 1024 = 500 736 tokens). El script:
     1) carga el bloque de Wikipedia ES en streaming (sin repetir articulo),
     2) entrena la MoE sobre ese bloque,
     3) LIBERA la RAM/GPU del bloque anterior antes de cargar el siguiente,
@@ -21,6 +21,7 @@ import time
 
 LAYER = int(os.environ.get("LAYER", "15"))
 SEQ = int(os.environ.get("SEQ", "1024"))
+BS_FWD = int(os.environ.get("BS_FWD", "8"))         # secuencias por forward del modelo
 LR = float(os.environ.get("LR", "3e-3"))
 SEED = int(os.environ.get("SEED", "123"))
 BLOCK_SEQS = int(os.environ.get("BLOCK_SEQS", "489"))  # >= 500 k tokens por bloque (489 x 1024 = 500 736)
@@ -156,7 +157,7 @@ vec_total = 0
 t0 = time.time()
 
 for bloque, bloque_idx in stream_wikipedia(BLOCK_SEQS, SEQ):
-    ids_t = torch.tensor(bloque, device=device)
+    # forward en sub-batches, NO ids_t entero (OOM en T4)
     cap = []
 
     def hook(module, inp, out):
@@ -164,10 +165,12 @@ for bloque, bloque_idx in stream_wikipedia(BLOCK_SEQS, SEQ):
                     out.detach().reshape(-1, HIDDEN).cpu().half()))
 
     handle = m_hook.register_forward_hook(hook)
-    with torch.no_grad():
-        model(input_ids=ids_t)
+    for j in range(0, len(bloque), BS_FWD):
+        ids_t = torch.tensor(bloque[j:j + BS_FWD], device=device)
+        with torch.no_grad():
+            model(input_ids=ids_t)
+        del ids_t
     handle.remove()
-    del ids_t
 
     X = torch.cat([h[0].float() for h in cap], dim=0)
     Y = torch.cat([o[0].float() for o in cap], dim=0)
