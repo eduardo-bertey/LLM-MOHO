@@ -30,6 +30,7 @@ BLOCK_SEQS = int(os.environ.get("BLOCK_SEQS", "489"))  # 489 x 1024 = 500 736 to
 BATCH = int(os.environ.get("BATCH", "64"))             # vectores por paso
 MICRO = int(os.environ.get("MICRO", "1024"))           # micro-batches dentro del paso
 EVAL_EVERY = int(os.environ.get("EVAL_EVERY", "20"))   # eval cada N pasos
+EPOCHS = int(os.environ.get("EPOCHS", "8"))            # pasadas sobre cada bloque
 W_LB = float(os.environ.get("W_LB", "0.01"))
 N_EXPERTS, TOP_K = 4, 2
 TARGET_COS, TARGET_R2 = 0.95, 0.90
@@ -52,7 +53,7 @@ def fail(m):
 
 log("=" * 60)
 log(f"MoE FF{LAYER} Qwen2.5-0.5B | 4 expertos top-{TOP_K} | BLOCK_SEQS {BLOCK_SEQS} "
-    f"({BLOCK_SEQS * SEQ} tokens) | lr {LR} batch {BATCH} micro {MICRO}")
+    f"({BLOCK_SEQS * SEQ} tokens) | epochs {EPOCHS} | lr {LR} batch {BATCH} micro {MICRO}")
 
 import torch
 import torch.nn.functional as F
@@ -237,34 +238,37 @@ for bloque, bloque_idx in stream_wikipedia(BLOCK_SEQS, SEQ):
         X_train = X
     del X
 
-    # --- entrenar ese bloque: shuffle sin reemplazo, 1 vector ~1 vez ---
+    # --- entrenar ese bloque: EPOCHS pasadas, shuffle sin reemplazo por epoca ---
     n_train = X_train.shape[0]
-    perm = torch.randperm(n_train, generator=torch.Generator().manual_seed(SEED + step))
     t_block = time.time()
-    for j in range(0, n_train, BATCH):
-        idx_cpu = perm[j:j + BATCH]              # X_train vive en CPU
-        if len(idx_cpu) == 0:
-            break
-        xb = X_train[idx_cpu].to(device).float()
-        with torch.no_grad():
-            yb = swiglu(xb, g_w, u_w, d_w)
-        opt.zero_grad(set_to_none=True)
-        loss_train = 0.0
-        for i in range(0, xb.shape[0], MICRO):
-            x_m, y_m = xb[i:i + MICRO], yb[i:i + MICRO]
-            y_s, lb, _ = moe(x_m)
-            nmse = ((y_s - y_m) ** 2).mean() / (y_m ** 2).mean()
-            cos_b = F.cosine_similarity(y_s, y_m, dim=-1).mean()
-            loss = (nmse + 0.1 * (1 - cos_b) + W_LB * lb) / max(1, (xb.shape[0] + MICRO - 1) // MICRO)
-            loss.backward()
-            loss_train += loss.item()
-        opt.step()
-        step += 1
-        del xb, yb, idx_cpu
-        if step % EVAL_EVERY == 0:
-            cos, r2, nmse, lb = eval_moe()
-            log(f"paso {step} loss {loss_train:.4f} | EVAL cos {cos:.4f} R2 {r2:.4f} "
-                f"NMSE {nmse:.4f} lb {lb:.4f} | bloque {bloque_idx} {time.time() - t_block:.0f}s")
+    for ep in range(EPOCHS):
+        perm = torch.randperm(n_train, generator=torch.Generator().manual_seed(SEED + step + ep))
+        for j in range(0, n_train, BATCH):
+            idx_cpu = perm[j:j + BATCH]              # X_train vive en CPU
+            if len(idx_cpu) == 0:
+                break
+            xb = X_train[idx_cpu].to(device).float()
+            with torch.no_grad():
+                yb = swiglu(xb, g_w, u_w, d_w)
+            opt.zero_grad(set_to_none=True)
+            loss_train = 0.0
+            for i in range(0, xb.shape[0], MICRO):
+                x_m, y_m = xb[i:i + MICRO], yb[i:i + MICRO]
+                y_s, lb, _ = moe(x_m)
+                nmse = ((y_s - y_m) ** 2).mean() / (y_m ** 2).mean()
+                cos_b = F.cosine_similarity(y_s, y_m, dim=-1).mean()
+                loss = (nmse + 0.1 * (1 - cos_b) + W_LB * lb) / max(1, (xb.shape[0] + MICRO - 1) // MICRO)
+                loss.backward()
+                loss_train += loss.item()
+            opt.step()
+            step += 1
+            del xb, yb, idx_cpu
+            if step % EVAL_EVERY == 0:
+                cos, r2, nmse, lb = eval_moe()
+                log(f"paso {step} ep {ep + 1}/{EPOCHS} loss {loss_train:.4f} | EVAL cos {cos:.4f} "
+                    f"R2 {r2:.4f} NMSE {nmse:.4f} lb {lb:.4f} | bloque {bloque_idx} "
+                    f"{time.time() - t_block:.0f}s")
+        log(f"[bloque {bloque_idx} ep {ep + 1}/{EPOCHS}] steps {step} | {time.time() - t_block:.0f}s")
 
     # --- LIBERAR la RAM del bloque antes del siguiente ---
     del X_train
