@@ -1,18 +1,20 @@
 #!/usr/bin/env python3
 """Destilar FF capa 15 Qwen2.5-0.5B -> MoE, BLOQUE A BLOQUE, Wikipedia ES sin repetir.
 
+Mismo flujo que colab_destilar_moe.py (captura real, eval disjoint, BLD, micro-batches),
+pero bloque a bloque:
+    1 bloque = BLOCK_SEQS secuencias de 1024 tokens (>= 500k tokens).
+    1) carga el bloque en streaming (sin repetir articulo),
+    2) captura SOLO la entrada h de la FF (la salida t se recalcula con swiglu),
+    3) entrena la MoE sobre ese bloque (shuffle sin reemplazo),
+    4) LIBERA la RAM/GPU del bloque antes de cargar el siguiente,
+    5) eval cos/R2/NMSE en set disjoint y guarda (sobrescribe) moe_layer15.pt.
+
 Uso en Colab:
     !git clone --depth 1 -b fix/ff-eval-real-activations https://github.com/eduardo-bertey/LLM-MOHO.git
     %cd LLM-MOHO/qwen-ff-local
     !python3 train_15_ff.py
-
-Regla: 1 bloque >= 500 k tokens (489 seq x 1024 = 500 736 tokens). El script:
-    1) carga el bloque de Wikipedia ES en streaming (sin repetir articulo),
-    2) entrena la MoE sobre ese bloque,
-    3) LIBERA la RAM/GPU del bloque anterior antes de cargar el siguiente,
-    4) imprime cos/R2/NMSE en eval fijo y guarda (sobrescribe) moe_layer15.pt.
 """
-import json
 import math
 import os
 import subprocess
@@ -24,10 +26,13 @@ SEQ = int(os.environ.get("SEQ", "1024"))
 BS_FWD = int(os.environ.get("BS_FWD", "8"))         # secuencias por forward del modelo
 LR = float(os.environ.get("LR", "3e-3"))
 SEED = int(os.environ.get("SEED", "123"))
-BLOCK_SEQS = int(os.environ.get("BLOCK_SEQS", "489"))  # >= 500 k tokens por bloque (489 x 1024 = 500 736)
-BATCH = int(os.environ.get("BATCH", "64"))
+BLOCK_SEQS = int(os.environ.get("BLOCK_SEQS", "489"))  # 489 x 1024 = 500 736 tokens por bloque
+BATCH = int(os.environ.get("BATCH", "64"))             # vectores por paso
+MICRO = int(os.environ.get("MICRO", "1024"))           # micro-batches dentro del paso
+EVAL_EVERY = int(os.environ.get("EVAL_EVERY", "20"))   # eval cada N pasos
 W_LB = float(os.environ.get("W_LB", "0.01"))
 N_EXPERTS, TOP_K = 4, 2
+TARGET_COS, TARGET_R2 = 0.95, 0.90
 MODEL_ID = "Qwen/Qwen2.5-0.5B"
 MODEL_DIR = os.environ.get("MODEL_DIR", "./modelo-qwen2.5-0.5b")
 CHECKPOINT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "moe_layer15.pt")
@@ -40,8 +45,14 @@ def log(m):
     LOG.write(m + "\n")
 
 
+def fail(m):
+    log(f"[ERROR] {m}")
+    sys.exit(1)
+
+
 log("=" * 60)
-log(f"MoE FF{LAYER} Qwen2.5-0.5B | 4 expertos top-2 | BLOCK_SEQS {BLOCK_SEQS} | lr {LR} batch {BATCH}")
+log(f"MoE FF{LAYER} Qwen2.5-0.5B | 4 expertos top-{TOP_K} | BLOCK_SEQS {BLOCK_SEQS} "
+    f"({BLOCK_SEQS * SEQ} tokens) | lr {LR} batch {BATCH} micro {MICRO}")
 
 import torch
 import torch.nn.functional as F
@@ -72,15 +83,17 @@ model.eval()
 cfg = model.config
 HIDDEN, INTER, N_LAYERS = cfg.hidden_size, cfg.intermediate_size, cfg.num_hidden_layers
 INTER_E = INTER // N_EXPERTS
-log(f"hidden {HIDDEN} | inter {INTER} | MoE {N_EXPERTS}x{INTER_E} | params {N_EXPERTS*3*INTER_E*HIDDEN:,}")
-m_hook = model.model.layers[LAYER].mlp
-for p in m_hook.parameters():
+log(f"hidden {HIDDEN} | inter {INTER} | capas {N_LAYERS} | MoE {N_EXPERTS}x{INTER_E} "
+    f"| params {N_EXPERTS * 3 * INTER_E * HIDDEN:,} (profesora {3 * INTER * HIDDEN:,})")
+
+teacher = model.model.layers[LAYER].mlp
+for p in teacher.parameters():
     p.requires_grad_(False)
 
 
 def stream_wikipedia(BLOCK_SEQS, SEQ):
-    """Devuelve bloques de BLOCK_SEQS secuencias (cada una SEQ tokens).
-    Itera wiki ES dos snapshots sin repetir articulo."""
+    """Bloques de BLOCK_SEQS secuencias (cada una SEQ tokens), wiki ES dos snapshots
+    sin repetir articulo."""
     total = 0
     bloque = 0
     for config in ["20231101.es", "20240501.es"]:
@@ -104,6 +117,10 @@ def stream_wikipedia(BLOCK_SEQS, SEQ):
             yield blk, bloque
             bloque += 1
     log(f"stream completo: bloques {bloque} | secuencias {total}")
+
+
+def swiglu(x, gate, up, down):
+    return F.silu(x @ gate.T) * (x @ up.T) @ down.T
 
 
 def init_origen(shape, fan_in):
@@ -148,85 +165,125 @@ class MoE(torch.nn.Module):
 
 moe = MoE().to(device)
 opt = torch.optim.AdamW(moe.parameters(), lr=LR, weight_decay=0.01)
+log(f"MoE params: {sum(p.numel() for p in moe.parameters()):,}")
+
+g_w = teacher.gate_proj.weight.float()
+u_w = teacher.up_proj.weight.float()
+d_w = teacher.down_proj.weight.float()
+
+
+def eval_moe():
+    """cos/R2/NMSE en el set disjoint (targets recalculados con la profesora)."""
+    with torch.no_grad():
+        y_t_chunks, y_chunks = [], []
+        for i in range(0, X_eval.shape[0], MICRO):
+            xb = X_eval[i:i + MICRO].to(device)
+            y_t_chunks.append(swiglu(xb, g_w, u_w, d_w))
+            ye, _lb_e, _f_e = moe(xb)
+            y_chunks.append(ye)
+        yt = torch.cat(y_t_chunks)
+        y = torch.cat(y_chunks)
+        cos = F.cosine_similarity(y, yt, dim=-1).mean().item()
+        r2 = 1 - ((y - yt) ** 2).sum().item() / max(((yt - yt.mean(0)) ** 2).sum().item(), 1e-12)
+        nmse = (((y - yt) ** 2).mean() / (yt ** 2).mean()).item()
+        probs = torch.softmax(y @ moe.router_w.T + moe.router_b, dim=-1)
+        idx = torch.topk(probs, TOP_K, dim=-1).indices
+        f = torch.bincount(idx.reshape(-1), minlength=N_EXPERTS).float() / idx.numel()
+        lb = (N_EXPERTS * (f * probs.mean(0)).sum()).item()
+    return cos, r2, nmse, lb
+
 
 X_eval = None
-Y_eval = None
 bloque_idx = 0
 step = 0
 vec_total = 0
 t0 = time.time()
 
 for bloque, bloque_idx in stream_wikipedia(BLOCK_SEQS, SEQ):
-    # forward en sub-batches, NO ids_t entero (OOM en T4)
+    # --- captura: SOLO la entrada h de la FF (sub-batches, no 489 de golpe: OOM T4) ---
     cap = []
 
     def hook(module, inp, out):
-        cap.append((inp[0].detach().reshape(-1, HIDDEN).cpu().half(),
-                    out.detach().reshape(-1, HIDDEN).cpu().half()))
+        cap.append(inp[0].detach().reshape(-1, HIDDEN).cpu().half())
 
-    handle = m_hook.register_forward_hook(hook)
+    handle = teacher.register_forward_hook(hook)
     t_start = time.time()
+    n_sub = (len(bloque) + BS_FWD - 1) // BS_FWD
     for j in range(0, len(bloque), BS_FWD):
         ids_t = torch.tensor(bloque[j:j + BS_FWD], device=device)
         with torch.no_grad():
             model(input_ids=ids_t)
-        if (j // BS_FWD) % 10 == 0:
-            v = (j // BS_FWD + 1) * BS_FWD * SEQ
-            print(f"[capture] bloque {bloque_idx} sub {j//BS_FWD + 1}/{(len(bloque)+BS_FWD-1)//BS_FWD} vec {v}", flush=True)
+        sub = j // BS_FWD
+        if sub % 10 == 0:
+            log(f"[capture] bloque {bloque_idx} sub {sub + 1}/{n_sub} vec {(sub + 1) * BS_FWD * SEQ}")
         del ids_t
     handle.remove()
-    n_cap = sum(c[0].shape[0] for c in cap)
-    print(f"[capture] bloque {bloque_idx} terminado en {time.time() - t_start:.1f}s, vectores {n_cap}", flush=True)
-
-
-    X = torch.cat([h[0].float() for h in cap], dim=0)
-    Y = torch.cat([o[0].float() for o in cap], dim=0)
+    X = torch.cat(cap, dim=0)
     del cap
     n = X.shape[0]
     vec_total += n
+    log(f"[capture] bloque {bloque_idx} terminado en {time.time() - t_start:.1f}s, vectores {n}")
 
-    # eval fijo (primer bloque solo): 512 vectores que nunca se entrenan
+    # --- eval fijo disjoint: del PRIMER bloque, jamas se entrena ---
     if X_eval is None:
-        X_eval, Y_eval = X[:512].clone(), Y[:512].clone()
+        n_eval = max(512, n // 5)
+        X_eval = X[:n_eval].float().clone()
+        X_train = X[n_eval:]
+        log(f"eval disjoint {X_eval.shape[0]} vectores (nunca se entrena) | "
+            f"train bloque 0: {X_train.shape[0]} vectores")
+        cos0, r20, nmse0, lb0 = eval_moe()
+        log(f"[eval inicial] cos {cos0:.4f} R2 {r20:.4f} NMSE {nmse0:.4f} lb {lb0:.4f}")
+    else:
+        X_train = X
+    del X
 
-    # entrenar sobre ese bloque sin retener memoria (batches barajados)
-    perm = torch.randperm(n)                     # cpu
-    for j in range(0, n, BATCH):
-        idx_cpu = perm[j:j + BATCH]             # indexar en CPU (X vive en cpu)
+    # --- entrenar ese bloque: shuffle sin reemplazo, 1 vector ~1 vez ---
+    n_train = X_train.shape[0]
+    perm = torch.randperm(n_train, generator=torch.Generator().manual_seed(SEED + step))
+    t_block = time.time()
+    for j in range(0, n_train, BATCH):
+        idx_cpu = perm[j:j + BATCH]              # X_train vive en CPU
         if len(idx_cpu) == 0:
             break
-        xb = X[idx_cpu].to(device).contiguous()
-        yb = Y[idx_cpu].to(device).contiguous()
-        m_out, lb, f = moe(xb)
-        cos_b = F.cosine_similarity(m_out, yb, dim=-1).mean()
-        loss = (m_out - yb).pow(2).mean() / (yb ** 2).mean() + 0.1 * (1 - cos_b) + W_LB * lb
+        xb = X_train[idx_cpu].to(device).float()
+        with torch.no_grad():
+            yb = swiglu(xb, g_w, u_w, d_w)
         opt.zero_grad(set_to_none=True)
-        loss.backward()
+        loss_train = 0.0
+        for i in range(0, xb.shape[0], MICRO):
+            x_m, y_m = xb[i:i + MICRO], yb[i:i + MICRO]
+            y_s, lb, _ = moe(x_m)
+            nmse = ((y_s - y_m) ** 2).mean() / (y_m ** 2).mean()
+            cos_b = F.cosine_similarity(y_s, y_m, dim=-1).mean()
+            loss = (nmse + 0.1 * (1 - cos_b) + W_LB * lb) / max(1, (xb.shape[0] + MICRO - 1) // MICRO)
+            loss.backward()
+            loss_train += loss.item()
         opt.step()
         step += 1
         del xb, yb, idx_cpu
-    # liberar RAM del bloque
-    del X, Y
+        if step % EVAL_EVERY == 0:
+            cos, r2, nmse, lb = eval_moe()
+            log(f"paso {step} loss {loss_train:.4f} | EVAL cos {cos:.4f} R2 {r2:.4f} "
+                f"NMSE {nmse:.4f} lb {lb:.4f} | bloque {bloque_idx} {time.time() - t_block:.0f}s")
+
+    # --- LIBERAR la RAM del bloque antes del siguiente ---
+    del X_train
     if device == "cuda":
         torch.cuda.empty_cache()
 
-    cos = r2 = nmse = 0.0
-    if X_eval is not None:
-        with torch.no_grad():
-            ye, _lb_e, _f_e = moe(X_eval.to(device))
-            yt = Y_eval.to(device)
-            cos = F.cosine_similarity(ye, yt, dim=-1).mean().item()
-            r2 = 1 - ((ye - yt) ** 2).sum().item() / max(((yt - yt.mean(0)) ** 2).sum().item(), 1e-12)
-            nmse = (((ye - yt) ** 2).mean() / (yt ** 2).mean()).item()
-    # guardar SOBRESCRIBIENDO
+    cos, r2, nmse, lb = eval_moe()
     sd = {k: v.detach().cpu() for k, v in moe.state_dict().items()}
     sd.update({"layer": LAYER, "n_experts": N_EXPERTS, "top_k": TOP_K, "inter_e": INTER_E,
                "hidden": HIDDEN, "steps_seen": step, "lr": LR, "blocks": bloque_idx,
-               "vec_total": vec_total, "cos": cos, "r2": r2})
+               "vec_total": vec_total, "cos": cos, "r2": r2, "nmse": nmse})
     with open(CHECKPOINT, "wb") as f:
         torch.save(sd, f)
-    log(f"[bloque {bloque_idx:3d}] steps {step} | vec {vec_total} | cos {cos:.4f} R2 {r2:.4f} | [save] {CHECKPOINT}")
+    log(f"[bloque {bloque_idx:3d}] steps {step} | vec {vec_total} | cos {cos:.4f} R2 {r2:.4f} "
+        f"NMSE {nmse:.4f} | [save] {CHECKPOINT}")
 
-del model, tok, m_hook
+cos, r2, nmse, lb = eval_moe()
+ok = cos >= TARGET_COS and r2 > TARGET_R2
+log(f"[eval final] cos {cos:.4f} R2 {r2:.4f} NMSE {nmse:.4f} lb {lb:.4f} | "
+    f"meta cos>={TARGET_COS} y R2>{TARGET_R2}: {'SI' if ok else 'NO'}")
 log(f"[time] {time.time() - t0:.1f}s | bloques {bloque_idx + 1} | pasos {step} | vectores {vec_total}")
 log("OK: moe_layer15.pt sobrescrito.")
