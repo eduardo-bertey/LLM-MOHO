@@ -170,6 +170,10 @@ class MoE(torch.nn.Module):
         self.router_b = torch.nn.Parameter(torch.zeros(N_EXPERTS))
 
     def forward(self, x):
+        # Al generar, Qwen pasa hidden_states 3D (batch, seq, hidden);
+        # en train es 2D (N, hidden). Aplanar a 2D y volver a la forma original.
+        orig_shape = x.shape
+        x = x.reshape(-1, x.shape[-1])
         logits = x @ self.router_w.T + self.router_b
         probs = torch.softmax(logits, dim=-1)
         w_top, idx = torch.topk(probs, TOP_K, dim=-1)
@@ -183,7 +187,7 @@ class MoE(torch.nn.Module):
             y[rows] += ye * w_top[rows, cols][:, None]
         f = torch.bincount(idx.reshape(-1), minlength=N_EXPERTS).float() / idx.numel()
         lb = N_EXPERTS * (f * probs.mean(0)).sum()
-        return y, lb, f
+        return y.reshape(orig_shape), lb, f
 
 
 moe = MoE().to(device)
