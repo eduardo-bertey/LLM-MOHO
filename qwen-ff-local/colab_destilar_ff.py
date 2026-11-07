@@ -33,8 +33,8 @@ import time
 
 # ---------------------------------------------------------------- ajustes
 LAYER = int(os.environ.get("LAYER", "0"))
-BATCH = int(os.environ.get("BATCH", "32"))      # secuencias por paso
-SEQ = int(os.environ.get("SEQ", "512"))         # tokens por secuencia
+BATCH = int(os.environ.get("BATCH", "64"))      # secuencias por paso
+SEQ = int(os.environ.get("SEQ", "1024"))         # tokens por secuencia
 STEPS = int(os.environ.get("STEPS", "300"))
 LR = float(os.environ.get("LR", "5e-4"))
 REDUCCION = float(os.environ.get("REDUCCION", "0.75"))  # 0.75 = inter 3648
