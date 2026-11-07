@@ -3,7 +3,7 @@
 
 Mismo flujo que colab_destilar_moe.py (captura real, eval disjoint, BLD, micro-batches),
 pero bloque a bloque:
-    1 bloque = BLOCK_SEQS secuencias de 1024 tokens (>= 500k tokens).
+    1 bloque = BLOCK_CHARS caracteres de TEXTO de Wikipedia (500k de texto, no tokens).
     1) carga el bloque en streaming (sin repetir articulo),
     2) captura SOLO la entrada h de la FF (la salida t se recalcula con swiglu),
     3) entrena la MoE sobre ese bloque (shuffle sin reemplazo),
@@ -23,10 +23,10 @@ import time
 
 LAYER = int(os.environ.get("LAYER", "15"))
 SEQ = int(os.environ.get("SEQ", "1024"))
-BS_FWD = int(os.environ.get("BS_FWD", "8"))         # secuencias por forward del modelo
+BS_FWD = int(os.environ.get("BS_FWD", "32"))         # secuencias por forward (prefill paralelo)
 LR = float(os.environ.get("LR", "1e-3"))
 SEED = int(os.environ.get("SEED", "123"))
-BLOCK_SEQS = int(os.environ.get("BLOCK_SEQS", "489"))  # 489 x 1024 = 500 736 tokens por bloque
+BLOCK_CHARS = int(os.environ.get("BLOCK_CHARS", "500000"))  # 500k caracteres de TEXTO de wiki por bloque (no tokens)
 BATCH = int(os.environ.get("BATCH", "56"))             # secuencias por paso (BATCH x SEQ vectores)
 MICRO = int(os.environ.get("MICRO", "1024"))           # micro-batches dentro del paso
 EVAL_EVERY = int(os.environ.get("EVAL_EVERY", "1"))    # eval cada N pasos (7 pasos por bloque)
@@ -52,8 +52,8 @@ def fail(m):
 
 
 log("=" * 60)
-log(f"MoE FF{LAYER} Qwen2.5-0.5B | 4 expertos top-{TOP_K} | BLOCK_SEQS {BLOCK_SEQS} "
-    f"({BLOCK_SEQS * SEQ} tokens) | epochs {EPOCHS} | lr {LR} batch {BATCH} seq {SEQ} "
+log(f"MoE FF{LAYER} Qwen2.5-0.5B | 4 expertos top-{TOP_K} | bloque {BLOCK_CHARS:,} chars de texto wiki "
+    f"| epochs {EPOCHS} | lr {LR} batch {BATCH} seq {SEQ} "
     f"= {BATCH * SEQ} vectores/paso | micro {MICRO}")
 
 import torch
@@ -93,31 +93,57 @@ for p in teacher.parameters():
     p.requires_grad_(False)
 
 
-def stream_wikipedia(BLOCK_SEQS, SEQ):
-    """Bloques de BLOCK_SEQS secuencias (cada una SEQ tokens), wiki ES dos snapshots
-    sin repetir articulo."""
+def stream_wikipedia(BLOCK_CHARS, SEQ):
+    """Bloques de BLOCK_CHARS caracteres de texto REAL de wiki ES (no tokens),
+    dos snapshots sin repetir articulo. El texto se tokeniza en seq de SEQ tokens."""
+    chars = 0
     total = 0
     bloque = 0
+    pend = []          # ids sobrantes del bloque anterior (sin repetir)
     for config in ["20231101.es", "20240501.es"]:
         ds = datasets.load_dataset("wikimedia/wikipedia", config, split="train", streaming=True)
-        blk = []
+        txts = []
         for art in ds:
             txt = (art.get("text") or "").strip()
             if len(txt) < 2000:
                 continue
-            ids = tok(txt, add_special_tokens=False)["input_ids"]
+            txts.append(txt)
+            chars += len(txt)
+            if chars < BLOCK_CHARS:
+                continue
+            # bloque completo: tokenizar todo lo acumulado
+            ids_all = pend
+            for t in txts:
+                ids_all += tok(t, add_special_tokens=False)["input_ids"]
+            blk = []
             i = 0
-            while i + SEQ <= len(ids):
-                blk.append(ids[i:i + SEQ])
+            while i + SEQ <= len(ids_all):
+                blk.append(ids_all[i:i + SEQ])
                 total += 1
                 i += SEQ
-                if len(blk) >= BLOCK_SEQS:
-                    yield blk, bloque
-                    blk = []
-                    bloque += 1
-        if blk:
-            yield blk, bloque
+            pend = ids_all[i:]          # sobra < SEQ tokens: siguen en el proximo bloque
+            yield blk, bloque, chars
+            blk = []
+            txts = []
+            chars = 0
             bloque += 1
+        # fin de snapshot: tokenizar lo acumulado aunque no llegue a BLOCK_CHARS
+        if txts:
+            ids_all = pend
+            for t in txts:
+                ids_all += tok(t, add_special_tokens=False)["input_ids"]
+            blk = []
+            i = 0
+            while i + SEQ <= len(ids_all):
+                blk.append(ids_all[i:i + SEQ])
+                total += 1
+                i += SEQ
+            pend = ids_all[i:]
+            if blk:
+                yield blk, bloque, chars
+                bloque += 1
+            txts = []
+            chars = 0
     log(f"stream completo: bloques {bloque} | secuencias {total}")
 
 
@@ -192,7 +218,7 @@ def eval_moe():
         idx = torch.topk(probs, TOP_K, dim=-1).indices
         f = torch.bincount(idx.reshape(-1), minlength=N_EXPERTS).float() / idx.numel()
         lb = (N_EXPERTS * (f * probs.mean(0)).sum()).item()
-    return cos, r2, nmse, lb
+    return cos, r2, nmse, lb, f.cpu().tolist()
 
 
 X_eval = None
@@ -201,7 +227,8 @@ step = 0
 vec_total = 0
 t0 = time.time()
 
-for bloque, bloque_idx in stream_wikipedia(BLOCK_SEQS, SEQ):
+for bloque, bloque_idx, b_chars in stream_wikipedia(BLOCK_CHARS, SEQ):
+    log(f"[bloque {bloque_idx}] {b_chars:,} chars de texto wiki -> {len(bloque)} seq x {SEQ}")
     # --- captura: SOLO la entrada h de la FF (sub-batches, no 489 de golpe: OOM T4) ---
     cap = []
 
@@ -211,10 +238,11 @@ for bloque, bloque_idx in stream_wikipedia(BLOCK_SEQS, SEQ):
     handle = teacher.register_forward_hook(hook)
     t_start = time.time()
     n_sub = (len(bloque) + BS_FWD - 1) // BS_FWD
+    base = model.model                       # solo el decoder: SIN lm_head (evita logits gigantes)
     for j in range(0, len(bloque), BS_FWD):
         ids_t = torch.tensor(bloque[j:j + BS_FWD], device=device)
-        with torch.no_grad():
-            model(input_ids=ids_t)
+        with torch.inference_mode():
+            base(input_ids=ids_t)           # prefill paralelo de BS_FWD seqs
         sub = j // BS_FWD
         if sub % 20 == 0:
             log(f"[capture] bloque {bloque_idx} sub {sub + 1}/{n_sub} vec {(sub + 1) * BS_FWD * SEQ}")
@@ -233,8 +261,9 @@ for bloque, bloque_idx in stream_wikipedia(BLOCK_SEQS, SEQ):
         X_train = X[n_eval:]
         log(f"eval disjoint {X_eval.shape[0]} vectores (nunca se entrena) | "
             f"train bloque 0: {X_train.shape[0]} vectores")
-        cos0, r20, nmse0, lb0 = eval_moe()
-        log(f"[eval inicial] cos {cos0:.4f} R2 {r20:.4f} NMSE {nmse0:.4f} lb {lb0:.4f}")
+        cos0, r20, nmse0, lb0, f0 = eval_moe()
+        log(f"[eval inicial] cos {cos0:.4f} R2 {r20:.4f} NMSE {nmse0:.4f} lb {lb0:.4f} "
+            f"frac {['%.2f' % v for v in f0]}")
     else:
         X_train = X
     del X
@@ -268,10 +297,10 @@ for bloque, bloque_idx in stream_wikipedia(BLOCK_SEQS, SEQ):
             step += 1
             del xb, yb, idx_cpu
             if step % EVAL_EVERY == 0:
-                cos, r2, nmse, lb = eval_moe()
+                cos, r2, nmse, lb, fr = eval_moe()
                 log(f"paso {step} ep {ep + 1}/{EPOCHS} loss {loss_train:.4f} | EVAL cos {cos:.4f} "
-                    f"R2 {r2:.4f} NMSE {nmse:.4f} lb {lb:.4f} | bloque {bloque_idx} "
-                    f"{time.time() - t_block:.0f}s")
+                    f"R2 {r2:.4f} NMSE {nmse:.4f} lb {lb:.4f} frac {['%.2f' % v for v in fr]} | "
+                    f"bloque {bloque_idx} {time.time() - t_block:.0f}s")
         log(f"[bloque {bloque_idx} ep {ep + 1}/{EPOCHS}] steps {step} | {time.time() - t_block:.0f}s")
 
     # --- LIBERAR la RAM del bloque antes del siguiente ---
@@ -279,19 +308,20 @@ for bloque, bloque_idx in stream_wikipedia(BLOCK_SEQS, SEQ):
     if device == "cuda":
         torch.cuda.empty_cache()
 
-    cos, r2, nmse, lb = eval_moe()
+    cos, r2, nmse, lb, fr = eval_moe()
     sd = {k: v.detach().cpu() for k, v in moe.state_dict().items()}
     sd.update({"layer": LAYER, "n_experts": N_EXPERTS, "top_k": TOP_K, "inter_e": INTER_E,
                "hidden": HIDDEN, "steps_seen": step, "lr": LR, "blocks": bloque_idx,
-               "vec_total": vec_total, "cos": cos, "r2": r2, "nmse": nmse})
+               "vec_total": vec_total, "cos": cos, "r2": r2, "nmse": nmse, "lb": lb, "frac": fr})
     with open(CHECKPOINT, "wb") as f:
         torch.save(sd, f)
     log(f"[bloque {bloque_idx:3d}] steps {step} | vec {vec_total} | cos {cos:.4f} R2 {r2:.4f} "
-        f"NMSE {nmse:.4f} | [save] {CHECKPOINT}")
+        f"NMSE {nmse:.4f} lb {lb:.4f} frac {['%.2f' % v for v in fr]} | [save] {CHECKPOINT}")
 
-cos, r2, nmse, lb = eval_moe()
+cos, r2, nmse, lb, fr = eval_moe()
 ok = cos >= TARGET_COS and r2 > TARGET_R2
-log(f"[eval final] cos {cos:.4f} R2 {r2:.4f} NMSE {nmse:.4f} lb {lb:.4f} | "
+log(f"[eval final] cos {cos:.4f} R2 {r2:.4f} NMSE {nmse:.4f} lb {lb:.4f} "
+    f"frac {['%.2f' % v for v in fr]} | "
     f"meta cos>={TARGET_COS} y R2>{TARGET_R2}: {'SI' if ok else 'NO'}")
 log(f"[time] {time.time() - t0:.1f}s | bloques {bloque_idx + 1} | pasos {step} | vectores {vec_total}")
 log("OK: moe_layer15.pt sobrescrito.")
