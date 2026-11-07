@@ -254,6 +254,58 @@ def eval_moe():
 cos0, r20, nmse0, lb0, f0 = eval_moe()
 log(f"[eval inicial] cos {cos0:.4f} R2 {r20:.4f} NMSE {nmse0:.4f} lb {lb0:.4f} frac {['%.2f' % v for v in f0]}")
 
+# --- ESCALERA: prueba completa cada 300 pasos (300, 600, 900) ---
+# En cada escalon: eval cos/R2 + PPL en wiki no vista + 1 prompt, con SOLO
+# esta capa reemplazada, y se guarda el checkpoint de ese escalon.
+class MoEWrapper(torch.nn.Module):
+    def __init__(self, m):
+        super().__init__()
+        self.m = m
+        self.gate_proj = None
+        self.up_proj = None
+        self.down_proj = None
+
+    def forward(self, x):
+        y, _, _ = self.m(x)
+        return y
+
+
+def generar_prueba(modelo, prompt):
+    ids = tok(prompt, return_tensors="pt").to(device)
+    with torch.no_grad():
+        out = modelo.generate(**ids, max_new_tokens=30, do_sample=False,
+                              use_cache=True, pad_token_id=tok.eos_token_id)
+    return tok.decode(out[0], skip_special_tokens=True)
+
+
+def ppl_prueba(modelo):
+    ids = tok(TEXTO_PPL_WIKI, return_tensors="pt").to(device)
+    with torch.no_grad():
+        out = modelo(**ids, labels=ids["input_ids"])
+    return math.exp(out.loss.item())
+
+
+ETAPAS = []
+
+
+def prueba_escalon(paso, cos_e, r2_e, nmse_e):
+    moe.eval()
+    mlp_orig = model.model.layers[LAYER].mlp
+    model.model.layers[LAYER].mlp = MoEWrapper(moe).to(device)
+    with torch.no_grad():
+        ppl_m = ppl_prueba(model)
+        txt_m = generar_prueba(model, "La capital de Uruguay es")
+    model.model.layers[LAYER].mlp = mlp_orig
+    moe.train()
+    log(f"[ESCALON paso {paso}] cos {cos_e:.4f} R2 {r2_e:.4f} NMSE {nmse_e:.4f} | "
+        f"PPL MoE {ppl_m:.2f} | texto: {txt_m!r}")
+    torch.save({"state_dict": moe.state_dict(), "layer": LAYER, "inter_expert": INTER_E,
+                "n_experts": N_EXPERTS, "top_k": TOP_K, "cos": cos_e, "r2": r2_e, "nmse": nmse_e,
+                "ppl_moe": ppl_m, "paso": paso, "batch": BATCH, "seq": SEQ, "lr": LR, "seed": SEED},
+               f"moe_destilada_qwen25_capa{LAYER}_paso{paso}.pt")
+    ETAPAS.append({"paso": paso, "cos": cos_e, "r2": r2_e, "nmse": nmse_e, "ppl_moe": ppl_m,
+                   "texto": txt_m})
+
 opt = torch.optim.Adam(moe.parameters(), lr=LR, betas=(0.9, 0.999), eps=1e-8, weight_decay=0.0)
 vec_por_paso = BATCH * SEQ
 t0 = time.time()
@@ -290,6 +342,9 @@ for step in range(1, STEPS + 1):
         cos, r2, nmse, lb, f = eval_moe()
         log(f"paso {step}/{STEPS} loss_train {loss_train:.4f} | EVAL cos {cos:.4f} R2 {r2:.4f} NMSE {nmse:.4f} "
             f"lb {lb:.4f} frac {['%.2f' % v for v in f]} | {time.time() - t0:.0f}s")
+    if step % 300 == 0:  # escalera: prueba completa cada 300 pasos
+        c_e, r_e, n_e, _, _ = eval_moe()
+        prueba_escalon(step, c_e, r_e, n_e)
 
 cos, r2, nmse, lb, f = eval_moe()
 ok = cos >= TARGET_COS and r2 > TARGET_R2
@@ -388,4 +443,8 @@ with open("resultados-colab-moe.md", "w") as fo:
         fo.write(f"### Prompt: {pr!r}\n\n- Qwen normal: {tn!r}\n- Qwen con MoE: {tm!r}\n"
                  f"- Textos iguales: {'SI' if tn == tm else 'NO'}\n\n")
     fo.write(f"- PPL Wikipedia (no vista) normal {ppl_normal:.2f} | PPL con MoE {ppl_moe:.2f} | ratio {ppl_moe / ppl_normal:.3f}\n")
+    fo.write("\n## Escalera (prueba cada 300 pasos)\n\n")
+    for e in ETAPAS:
+        fo.write(f"- Paso {e['paso']}: cos {e['cos']:.4f} R2 {e['r2']:.4f} NMSE {e['nmse']:.4f} | "
+                 f"PPL MoE {e['ppl_moe']:.2f} | texto: {e['texto']!r}\n")
 log("Guardado: moe_destilada_qwen25_capa%d.pt, resultados-colab-moe.md, colab_destilar_moe.log" % LAYER)
