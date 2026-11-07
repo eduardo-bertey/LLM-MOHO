@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
-"""FF aislada Qwen2.5-0.5B, capa 0, solo numpy. v5: BLD (Puzzle, NVIDIA).
+"""FF aislada Qwen2.5-0.5B, capa 0, solo numpy. v6: BLD (Puzzle, NVIDIA),
+destilacion HONESTA al 75% (intermediate 4864 -> 3648, ~9,8M params).
 
-Tecnica: Blockwise Local Distillation. La alumna imita a la profesora
-aislada, con entradas siempre del padre (activaciones reales post-RMSNorm
-de tokens por Qwen), gradientes aislados, profesora congelada.
-Perdida: NMSE Puzzle + 0,1*(1-cos). Mismo tamano (intermediate 4864),
-sin reduccion. Init: desde la profesora (copia o copia + ruido chico),
-o init de origen del repo (randn * 1/sqrt(fan_in), seed 123).
-El gaussiano es solo smoke test, no dato de entrenamiento.
-Uso: python3 ff_aislada_qwen25.py --batch 1 --seq 64 --steps 20 --lr 1e-3 --tag e1
+La alumna NO copia pesos de la profesora: init de origen del repo
+(randn * 1/sqrt(fan_in), seed 123), y aprende solo por destilacion
+con perdida NMSE Puzzle + 0,1*(1-cos) sobre activaciones reales
+post-RMSNorm de tokens por Qwen. Profesora congelada, gradientes
+aislados, entradas siempre del padre. El gaussiano es solo smoke test.
+Uso: python3 ff_aislada_qwen25.py --inter 3648 --batch 4 --seq 64 --steps 50 --lr 1e-3 --tag e8r75
 """
 import argparse
 import json
@@ -138,29 +137,37 @@ def main():
     ap.add_argument("--tag", default="e1")
     ap.add_argument("--pool-size", type=int, default=4096)
     ap.add_argument("--init", default="origen", choices=["origen", "teacher", "teacher_noise"])
+    ap.add_argument("--inter", type=int, default=4864)
     ap.add_argument("--noise-frac", type=float, default=0.1)
     ap.add_argument("--data", default="real", choices=["real", "gauss"])
+    ap.add_argument("--data-file", default="activaciones-reales-qwen25.npz")
+    ap.add_argument("--resume", default="")
     ap.add_argument("--loss", default="nmse_cos", choices=["nmse_cos", "mse"])
     args = ap.parse_args()
 
     t0 = time.time()
+    global INTER
+    INTER = args.inter
     vec_step = args.batch * args.seq
     rng = np.random.default_rng(args.seed)
-    print(f"=== {args.tag}: batch={args.batch} seq={args.seq} "
+    print(f"=== {args.tag}: inter={INTER} batch={args.batch} seq={args.seq} "
           f"vectores/paso={vec_step} steps={args.steps} lr={args.lr} "
           f"init={args.init} seed={args.seed} data={args.data} loss={args.loss} ===", flush=True)
     print(f"[mem] disponible antes: {mem_available_mib():.0f} MiB", flush=True)
     if args.data == "real":
-        print("entradas: ACTIVACIONES REALES (activaciones-reales-qwen25.npz)", flush=True)
+        print(f"entradas: ACTIVACIONES REALES ({args.data_file})", flush=True)
     else:
         print("entradas: gaussianas N(0,1) [SMOKE, NO REAL]", flush=True)
 
     wg_t, wu_t, wd_t = load_ff0(SAFETENSORS)
     print(f"FF0 profesora: 13,074,432 params, "
           f"{(wg_t.nbytes + wu_t.nbytes + wd_t.nbytes) / 1e6:.1f} MB fp32", flush=True)
+    n_params_s = 2 * INTER * HIDDEN + HIDDEN * INTER
+    print(f"FF alumna: inter={INTER}, {n_params_s:,} params "
+          f"({100.0 * INTER / 4864:.0f}% de la profesora)", flush=True)
 
     if args.data == "real":
-        d = np.load(BASE + "/activaciones-reales-qwen25.npz")
+        d = np.load(BASE + "/" + args.data_file)
         x_pool, y_pool = d["x_train"], d["y_train"]
         x_ev, y_ev = d["x_eval"], d["y_eval"]
         print(f"datos reales: train {x_pool.shape[0]} vectores, "
@@ -196,8 +203,8 @@ def main():
         wg_s = init_origen((INTER, HIDDEN), 1.0 / np.sqrt(HIDDEN), rng)
         wu_s = init_origen((INTER, HIDDEN), 1.0 / np.sqrt(HIDDEN), rng)
         wd_s = init_origen((HIDDEN, INTER), 1.0 / np.sqrt(INTER), rng)
-        print(f"init origen: gate/up std={wg_s.std():.4f} (1/sqrt(896)=0,0334), "
-              f"down std={wd_s.std():.4f} (1/sqrt(4864)=0,0143), con paso bf16", flush=True)
+        print(f"init origen: gate/up ({INTER}x{HIDDEN}) std={wg_s.std():.4f} (1/sqrt(896)=0,0334), "
+              f"down std={wd_s.std():.4f} (1/sqrt({INTER})={1.0 / np.sqrt(INTER):.4f}), con paso bf16", flush=True)
     elif args.init == "teacher":
         # Copia exacta de la profesora (BLD: init desde el padre).
         wg_s, wu_s, wd_s = wg_t.copy(), wu_t.copy(), wd_t.copy()
@@ -209,6 +216,15 @@ def main():
         wg_s, wu_s, wd_s = _noisy(wg_t), _noisy(wu_t), _noisy(wd_t)
         print(f"init teacher_noise: profesora + ruido {args.noise_frac:.2f}*std", flush=True)
     params = [wg_s, wu_s, wd_s]
+    if args.resume:
+        # Reanudar desde un checkpoint (pesos alumna guardados, mismo inter).
+        rc = np.load(args.resume)
+        params = [rc["gate_proj"].astype(np.float32),
+                  rc["up_proj"].astype(np.float32),
+                  rc["down_proj"].astype(np.float32)]
+        wg_s, wu_s, wd_s = params
+        print(f"[resume] cargado checkpoint {args.resume} "
+              f"(Adam m/v reinician en cero)", flush=True)
     m = [np.zeros_like(p) for p in params]
     v = [np.zeros_like(p) for p in params]
     b1, b2, eps = 0.9, 0.999, 1e-8
@@ -265,7 +281,7 @@ def main():
     out = f"{BASE}/checkpoints/ff_destilada_qwen25_{args.tag}.npz"
     np.savez(out, gate_proj=params[0], up_proj=params[1], down_proj=params[2])
     print(f"pesos alumna: {out}", flush=True)
-    print(f"RESULT tag={args.tag} batch={args.batch} seq={args.seq} steps={args.steps} "
+    print(f"RESULT tag={args.tag} inter={INTER} batch={args.batch} seq={args.seq} steps={args.steps} "
           f"lr={args.lr} init={args.init} data={args.data} loss={args.loss} "
           f"cos={cos:.4f} mag={mag:.4f} "
           f"rel_err={rel:.4f} R2={r2:.4f} NMSE={nmse:.4f} tiempo={time.time() - t0:.0f}s", flush=True)
