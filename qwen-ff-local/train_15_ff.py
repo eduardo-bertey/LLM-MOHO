@@ -24,13 +24,13 @@ import time
 LAYER = int(os.environ.get("LAYER", "15"))
 SEQ = int(os.environ.get("SEQ", "1024"))
 BS_FWD = int(os.environ.get("BS_FWD", "8"))         # secuencias por forward del modelo
-LR = float(os.environ.get("LR", "3e-3"))
+LR = float(os.environ.get("LR", "1e-3"))
 SEED = int(os.environ.get("SEED", "123"))
 BLOCK_SEQS = int(os.environ.get("BLOCK_SEQS", "489"))  # 489 x 1024 = 500 736 tokens por bloque
 BATCH = int(os.environ.get("BATCH", "64"))             # vectores por paso
 MICRO = int(os.environ.get("MICRO", "1024"))           # micro-batches dentro del paso
 EVAL_EVERY = int(os.environ.get("EVAL_EVERY", "20"))   # eval cada N pasos
-EPOCHS = int(os.environ.get("EPOCHS", "8"))            # pasadas sobre cada bloque
+EPOCHS = int(os.environ.get("EPOCHS", "1"))            # pasadas por bloque (1 = sin repetir datos)
 W_LB = float(os.environ.get("W_LB", "0.01"))
 N_EXPERTS, TOP_K = 4, 2
 TARGET_COS, TARGET_R2 = 0.95, 0.90
@@ -165,7 +165,7 @@ class MoE(torch.nn.Module):
 
 
 moe = MoE().to(device)
-opt = torch.optim.AdamW(moe.parameters(), lr=LR, weight_decay=0.01)
+opt = torch.optim.Adam(moe.parameters(), lr=LR, betas=(0.9, 0.999), eps=1e-8, weight_decay=0.0)
 log(f"MoE params: {sum(p.numel() for p in moe.parameters()):,}")
 
 g_w = teacher.gate_proj.weight.float()
@@ -260,6 +260,7 @@ for bloque, bloque_idx in stream_wikipedia(BLOCK_SEQS, SEQ):
                 loss = (nmse + 0.1 * (1 - cos_b) + W_LB * lb) / max(1, (xb.shape[0] + MICRO - 1) // MICRO)
                 loss.backward()
                 loss_train += loss.item()
+            torch.nn.utils.clip_grad_norm_(moe.parameters(), 1.0)
             opt.step()
             step += 1
             del xb, yb, idx_cpu
