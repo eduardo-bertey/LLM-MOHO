@@ -28,7 +28,7 @@ MoE con PRESUPUESTO IGUAL A LA PROFESORA:
     (NMSE + 0.1*(1-cos)) + perdida de balanceo del router (peso 0.01).
 
 Ajustes (variables de entorno):
-  LAYER=0  BATCH=56  SEQ=1024  STEPS=300  LR=5e-4  SEED=123
+  LAYER=0  BATCH=56  SEQ=1024  STEPS=900  LR=5e-4  SEED=123
   N_TOKENS_CAPTURA=500000 (Wikipedia en espanol, ~500 seq x 1024 tokens)
   N_SEQ_CAPTURA = secuencias de SEQ tokens a pasar por Qwen para capturar
   activaciones (500 x 1024 = 512000 vectores). Si Colab va lento, bajar a 200.
@@ -43,7 +43,7 @@ import time
 LAYER = int(os.environ.get("LAYER", "0"))
 BATCH = int(os.environ.get("BATCH", "56"))
 SEQ = int(os.environ.get("SEQ", "1024"))
-STEPS = int(os.environ.get("STEPS", "300"))
+STEPS = int(os.environ.get("STEPS", "900"))
 LR = float(os.environ.get("LR", "5e-4"))
 SEED = int(os.environ.get("SEED", "123"))
 N_TOKENS_CAPTURA = int(os.environ.get("N_TOKENS_CAPTURA", "500000"))
