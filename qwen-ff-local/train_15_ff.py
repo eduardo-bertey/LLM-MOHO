@@ -170,8 +170,9 @@ for bloque, bloque_idx in stream_wikipedia(BLOCK_SEQS, SEQ):
         ids_t = torch.tensor(bloque[j:j + BS_FWD], device=device)
         with torch.no_grad():
             model(input_ids=ids_t)
-        v = (j // BS_FWD + 1) * BS_FWD * SEQ
-        print(f"[capture] bloque {bloque_idx} sub {j//BS_FWD + 1}/{(len(bloque)+BS_FWD-1)//BS_FWD} vec {v}", flush=True)
+        if (j // BS_FWD) % 10 == 0:
+            v = (j // BS_FWD + 1) * BS_FWD * SEQ
+            print(f"[capture] bloque {bloque_idx} sub {j//BS_FWD + 1}/{(len(bloque)+BS_FWD-1)//BS_FWD} vec {v}", flush=True)
         del ids_t
     handle.remove()
     n_cap = sum(c[0].shape[0] for c in cap)
@@ -212,7 +213,7 @@ for bloque, bloque_idx in stream_wikipedia(BLOCK_SEQS, SEQ):
     cos = r2 = nmse = 0.0
     if X_eval is not None:
         with torch.no_grad():
-            ye, _ = moe(X_eval.to(device))
+            ye, _lb_e, _f_e = moe(X_eval.to(device))
             yt = Y_eval.to(device)
             cos = F.cosine_similarity(ye, yt, dim=-1).mean().item()
             r2 = 1 - ((ye - yt) ** 2).sum().item() / max(((yt - yt.mean(0)) ** 2).sum().item(), 1e-12)
