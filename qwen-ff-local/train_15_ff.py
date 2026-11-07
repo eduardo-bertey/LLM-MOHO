@@ -27,9 +27,9 @@ BS_FWD = int(os.environ.get("BS_FWD", "8"))         # secuencias por forward del
 LR = float(os.environ.get("LR", "1e-3"))
 SEED = int(os.environ.get("SEED", "123"))
 BLOCK_SEQS = int(os.environ.get("BLOCK_SEQS", "489"))  # 489 x 1024 = 500 736 tokens por bloque
-BATCH = int(os.environ.get("BATCH", "64"))             # vectores por paso
+BATCH = int(os.environ.get("BATCH", "56"))             # secuencias por paso (BATCH x SEQ vectores)
 MICRO = int(os.environ.get("MICRO", "1024"))           # micro-batches dentro del paso
-EVAL_EVERY = int(os.environ.get("EVAL_EVERY", "20"))   # eval cada N pasos
+EVAL_EVERY = int(os.environ.get("EVAL_EVERY", "1"))    # eval cada N pasos (7 pasos por bloque)
 EPOCHS = int(os.environ.get("EPOCHS", "1"))            # pasadas por bloque (1 = sin repetir datos)
 W_LB = float(os.environ.get("W_LB", "0.01"))
 N_EXPERTS, TOP_K = 4, 2
@@ -53,7 +53,8 @@ def fail(m):
 
 log("=" * 60)
 log(f"MoE FF{LAYER} Qwen2.5-0.5B | 4 expertos top-{TOP_K} | BLOCK_SEQS {BLOCK_SEQS} "
-    f"({BLOCK_SEQS * SEQ} tokens) | epochs {EPOCHS} | lr {LR} batch {BATCH} micro {MICRO}")
+    f"({BLOCK_SEQS * SEQ} tokens) | epochs {EPOCHS} | lr {LR} batch {BATCH} seq {SEQ} "
+    f"= {BATCH * SEQ} vectores/paso | micro {MICRO}")
 
 import torch
 import torch.nn.functional as F
@@ -215,7 +216,7 @@ for bloque, bloque_idx in stream_wikipedia(BLOCK_SEQS, SEQ):
         with torch.no_grad():
             model(input_ids=ids_t)
         sub = j // BS_FWD
-        if sub % 10 == 0:
+        if sub % 20 == 0:
             log(f"[capture] bloque {bloque_idx} sub {sub + 1}/{n_sub} vec {(sub + 1) * BS_FWD * SEQ}")
         del ids_t
     handle.remove()
@@ -239,12 +240,14 @@ for bloque, bloque_idx in stream_wikipedia(BLOCK_SEQS, SEQ):
     del X
 
     # --- entrenar ese bloque: EPOCHS pasadas, shuffle sin reemplazo por epoca ---
+    # igual que colab_destilar_moe.py: 1 paso = BATCH secuencias x SEQ vectores
     n_train = X_train.shape[0]
+    vec_por_paso = BATCH * SEQ
     t_block = time.time()
     for ep in range(EPOCHS):
         perm = torch.randperm(n_train, generator=torch.Generator().manual_seed(SEED + step + ep))
-        for j in range(0, n_train, BATCH):
-            idx_cpu = perm[j:j + BATCH]              # X_train vive en CPU
+        for j in range(0, n_train, vec_por_paso):
+            idx_cpu = perm[j:j + vec_por_paso]        # X_train vive en CPU
             if len(idx_cpu) == 0:
                 break
             xb = X_train[idx_cpu].to(device).float()
