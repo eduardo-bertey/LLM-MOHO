@@ -227,32 +227,54 @@ step = 0
 vec_total = 0
 t0 = time.time()
 
-for bloque, bloque_idx, b_chars in stream_wikipedia(BLOCK_CHARS, SEQ):
-    log(f"[bloque {bloque_idx}] {b_chars:,} chars de texto wiki -> {len(bloque)} seq x {SEQ}")
-    # --- captura: SOLO la entrada h de la FF (sub-batches, no 489 de golpe: OOM T4) ---
-    cap = []
 
-    def hook(module, inp, out):
-        cap.append(inp[0].detach().reshape(-1, HIDDEN).cpu().half())
+def prefetch_worker(q):
+    """Hilo aparte: baja wiki + tokeniza + captura la MoE del SIGUIENTE bloque
+    mientras el hilo principal entrena el actual."""
+    try:
+        for blk, b_idx, b_chars in stream_wikipedia(BLOCK_CHARS, SEQ):
+            log(f"[prefetch] bloque {b_idx} {b_chars:,} chars wiki -> {len(blk)} seq x {SEQ}, capturando...")
+            cap = []
 
-    handle = teacher.register_forward_hook(hook)
-    t_start = time.time()
-    n_sub = (len(bloque) + BS_FWD - 1) // BS_FWD
-    base = model.model                       # solo el decoder: SIN lm_head (evita logits gigantes)
-    for j in range(0, len(bloque), BS_FWD):
-        ids_t = torch.tensor(bloque[j:j + BS_FWD], device=device)
-        with torch.inference_mode():
-            base(input_ids=ids_t)           # prefill paralelo de BS_FWD seqs
-        sub = j // BS_FWD
-        if sub % 20 == 0:
-            log(f"[capture] bloque {bloque_idx} sub {sub + 1}/{n_sub} vec {(sub + 1) * BS_FWD * SEQ}")
-        del ids_t
-    handle.remove()
-    X = torch.cat(cap, dim=0)
-    del cap
+            def hook(module, inp, out):
+                cap.append(inp[0].detach().reshape(-1, HIDDEN).cpu().half())
+
+            handle = teacher.register_forward_hook(hook)
+            t_start = time.time()
+            n_sub = (len(blk) + BS_FWD - 1) // BS_FWD
+            for j in range(0, len(blk), BS_FWD):
+                ids_t = torch.tensor(blk[j:j + BS_FWD], device=device)
+                with torch.inference_mode():
+                    model.model(input_ids=ids_t)     # decoder sin lm_head
+                if (j // BS_FWD) % 20 == 0:
+                    log(f"[prefetch] bloque {b_idx} sub {j // BS_FWD + 1}/{n_sub}")
+                del ids_t
+            handle.remove()
+            Xb = torch.cat(cap, dim=0)
+            del cap, blk
+            log(f"[prefetch] bloque {b_idx} listo en {time.time() - t_start:.1f}s, "
+                f"vectores {Xb.shape[0]}")
+            q.put((Xb, b_idx, b_chars))              # maxsize=1: espera si el train va lento
+        q.put(None)
+    except Exception as e:
+        log(f"[prefetch ERROR] {type(e).__name__}: {e}")
+        q.put(None)
+
+
+import queue
+import threading
+
+cola = queue.Queue(maxsize=1)
+threading.Thread(target=prefetch_worker, args=(cola,), daemon=True).start()
+
+while True:
+    item = cola.get()
+    if item is None:
+        break
+    X, bloque_idx, b_chars = item
     n = X.shape[0]
     vec_total += n
-    log(f"[capture] bloque {bloque_idx} terminado en {time.time() - t_start:.1f}s, vectores {n}")
+    log(f"[bloque {bloque_idx}] {b_chars:,} chars wiki | vectores {n} (captura en background)")
 
     # --- eval fijo disjoint: del PRIMER bloque, jamas se entrena ---
     if X_eval is None:
