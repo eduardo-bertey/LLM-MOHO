@@ -28,7 +28,7 @@ MoE con PRESUPUESTO IGUAL A LA PROFESORA:
     (NMSE + 0.1*(1-cos)) + perdida de balanceo del router (peso 0.01).
 
 Ajustes (variables de entorno):
-  LAYER=0  BATCH=64  SEQ=1024  STEPS=300  LR=5e-4  SEED=123  N_SEQ_CAPTURA=100
+  LAYER=0  BATCH=90  SEQ=1024  STEPS=300  LR=5e-4  SEED=123  N_SEQ_CAPTURA=100
   N_SEQ_CAPTURA = secuencias de SEQ tokens a pasar por Qwen para capturar
   activaciones (100 x 1024 = 102400 vectores). Si Colab va lento, bajar a 40.
 """
@@ -39,7 +39,7 @@ import sys
 import time
 
 LAYER = int(os.environ.get("LAYER", "0"))
-BATCH = int(os.environ.get("BATCH", "64"))
+BATCH = int(os.environ.get("BATCH", "90"))
 SEQ = int(os.environ.get("SEQ", "1024"))
 STEPS = int(os.environ.get("STEPS", "300"))
 LR = float(os.environ.get("LR", "5e-4"))
@@ -223,14 +223,19 @@ for step in range(1, STEPS + 1):
                     teacher.down_proj.weight.float())
     opt.zero_grad()
     loss_train = 0.0
-    for i in range(0, vec_por_paso, MICRO):
+    # ARREGLO nan: xb puede ser mas chico que vec_por_paso (train 8112 < 65536),
+    # antes el loop llegaba a micro-batches VACIOS y mean() de vacio = nan.
+    # Ahora se itera solo sobre los vectores reales de xb.
+    n_xb = xb.shape[0]
+    n_micro = (n_xb + MICRO - 1) // MICRO
+    for i in range(0, n_xb, MICRO):
         x_m, y_m = xb[i:i + MICRO], yb[i:i + MICRO]
         y_s, lb, _ = moe(x_m)
         nmse = ((y_s - y_m) ** 2).mean() / (y_m ** 2).mean()
         cos = torch.nn.functional.cosine_similarity(y_s, y_m, dim=-1).mean()
-        loss = (nmse + 0.1 * (1 - cos) + W_LB * lb) / (vec_por_paso // MICRO)
+        loss = (nmse + 0.1 * (1 - cos) + W_LB * lb) / n_micro
         loss.backward()
-        loss_train += loss.item() * (vec_por_paso // MICRO)
+        loss_train += loss.item() * n_micro
     opt.step()
     if step % 20 == 0 or step == 1:
         cos, r2, nmse, lb, f = eval_moe()
