@@ -28,13 +28,15 @@ MoE con PRESUPUESTO IGUAL A LA PROFESORA:
     (NMSE + 0.1*(1-cos)) + perdida de balanceo del router (peso 0.01).
 
 Ajustes (variables de entorno):
-  LAYER=0  BATCH=56  SEQ=1024  STEPS=300  LR=5e-4  SEED=123  N_SEQ_CAPTURA=100
+  LAYER=0  BATCH=56  SEQ=1024  STEPS=300  LR=5e-4  SEED=123
+  N_TOKENS_CAPTURA=500000 (Wikipedia en espanol, ~500 seq x 1024 tokens)
   N_SEQ_CAPTURA = secuencias de SEQ tokens a pasar por Qwen para capturar
-  activaciones (100 x 1024 = 102400 vectores). Si Colab va lento, bajar a 40.
+  activaciones (500 x 1024 = 512000 vectores). Si Colab va lento, bajar a 200.
 """
 import json
 import math
 import os
+import subprocess
 import sys
 import time
 
@@ -44,7 +46,8 @@ SEQ = int(os.environ.get("SEQ", "1024"))
 STEPS = int(os.environ.get("STEPS", "300"))
 LR = float(os.environ.get("LR", "5e-4"))
 SEED = int(os.environ.get("SEED", "123"))
-N_SEQ_CAPTURA = int(os.environ.get("N_SEQ_CAPTURA", "100"))
+N_TOKENS_CAPTURA = int(os.environ.get("N_TOKENS_CAPTURA", "500000"))
+N_SEQ_CAPTURA = int(os.environ.get("N_SEQ_CAPTURA", str(N_TOKENS_CAPTURA // SEQ)))
 MICRO = int(os.environ.get("MICRO", "1024"))
 W_LB = float(os.environ.get("W_LB", "0.01"))
 MODEL_ID = "Qwen/Qwen2.5-0.5B"
@@ -101,22 +104,64 @@ log(f"Modelo: hidden {HIDDEN}, inter {INTER}, capas {N_LAYERS}")
 log(f"MoE: {N_EXPERTS} expertos x inter {INTER_E} = {N_EXPERTS * 3 * INTER_E * HIDDEN:,} params "
     f"(profesora {3 * INTER * HIDDEN:,}) | activos/token top-{TOP_K}: {TOP_K * 3 * INTER_E * HIDDEN:,}")
 
-# --- textos reales largos para capturar (Wikipedia en espanol, via datasets si esta, si no textos largos) ---
+# --- datos: Wikipedia en espanol, ~500k tokens reales (no sinteticos) ---
+# Se baja por streaming con `datasets` (wikimedia/wikipedia 20231101.es),
+# se tokeniza cada articulo y se corta en secuencias de SEQ tokens.
+# Un articulo aparte queda como texto de PPL que el train nunca ve.
 TEXTOS_BASE = [
     "La destilacion de una red neuronal consiste en que un modelo alumno aprenda a imitar a un modelo profesor, copiando sus salidas en datos reales y no solo las etiquetas correctas. En el caso de una red feedforward, el alumno aprende a producir la misma salida que la profesora ante la misma entrada, aunque tenga menos parametros o una estructura distinta, como una mezcla de expertos.",
     "Montevideo es la capital de Uruguay y esta sobre el Rio de la Plata. Fue fundada en el siglo dieciocho y hoy es el centro politico, economico y cultural del pais. Su puerto es uno de los mas importantes de la region y su rambla recorre toda la costa de la ciudad.",
     "Un transformador es una arquitectura de red neuronal que usa el mecanismo de atencion para relacionar las palabras de una frase entre si. Cada capa tiene atencion multi-cabeza y una red feedforward, y se apilan muchas capas para formar modelos de lenguaje grandes.",
     "La fotosintesis es el proceso por el cual las plantas convierten la luz del sol, el agua y el dioxido de carbono en oxigeno y glucosa. Este proceso ocurre en los cloroplastos y es la base de casi toda la vida en la Tierra, porque produce el oxigeno que respiramos.",
 ]
-# repetir con variaciones para llegar a N_SEQ_CAPTURA secuencias distintas
-TEXTOS = []
-i = 0
-while len(TEXTOS) < N_SEQ_CAPTURA:
-    TEXTOS.append(TEXTOS_BASE[i % len(TEXTOS_BASE)] + f" Parrafo {i} sobre el tema anterior, con mas detalle y ejemplos concretos para completar el texto.")
-    i += 1
+TEXTO_PPL_WIKI = None  # articulo de Wikipedia no visto en train, para la PPL
 
-# --- captura real: pasar cada secuencia UNA vez, sin reemplazo, seq 512 ---
-log(f"Capturando activaciones REALES: {N_SEQ_CAPTURA} seq x {SEQ} tokens...")
+
+def cargar_wikipedia():
+    """Devuelve (secuencias_ids, n_articulos, n_tokens): listas de ids de SEQ tokens."""
+    try:
+        import datasets
+    except ImportError:
+        log("instalando datasets para bajar Wikipedia...")
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "datasets"])
+        import datasets
+    ds = datasets.load_dataset("wikimedia/wikipedia", "20231101.es", split="train", streaming=True)
+    seqs, total, n_art = [], 0, 0
+    for art in ds:
+        txt = (art.get("text") or "").strip()
+        if len(txt) < 2000:
+            continue
+        n_art += 1
+        # articulo 6 queda aparte para PPL: no entra en train, nunca se ve
+        if n_art == 6:
+            globals()["TEXTO_PPL_WIKI"] = txt[:4000]
+            continue
+        ids = tok(txt, add_special_tokens=False)["input_ids"]
+        for i in range(0, len(ids) - SEQ + 1, SEQ):
+            seqs.append(ids[i:i + SEQ])
+            total += SEQ
+            if total >= N_TOKENS_CAPTURA:
+                return seqs, n_art, total
+    return seqs, n_art, total
+
+
+try:
+    SEQS_IDS, N_ART, N_TOK = cargar_wikipedia()
+    log(f"Wikipedia ES: {N_ART} articulos, {len(SEQS_IDS)} secuencias x {SEQ} = {N_TOK} tokens")
+except Exception as e:
+    log(f"[AVISO] no se pudo bajar Wikipedia ({e}), uso los 4 textos base (fallback)")
+    SEQS_IDS = []
+    i = 0
+    while len(SEQS_IDS) < N_SEQ_CAPTURA:
+        ids = tok(TEXTOS_BASE[i % len(TEXTOS_BASE)], add_special_tokens=False)["input_ids"][:SEQ]
+        SEQS_IDS.append(ids)
+        i += 1
+    N_ART, N_TOK = 0, len(SEQS_IDS) * SEQ
+if TEXTO_PPL_WIKI is None:
+    TEXTO_PPL_WIKI = TEXTOS_BASE[1]
+
+# --- captura real: pasar cada secuencia UNA vez, sin reemplazo, seq 1024 ---
+log(f"Capturando activaciones REALES: {len(SEQS_IDS)} seq x {SEQ} tokens...")
 capturados = []
 
 
@@ -126,11 +171,11 @@ def hook_fn(module, inp, out):
 
 handle = model.model.layers[LAYER].mlp.register_forward_hook(hook_fn)
 with torch.no_grad():
-    for j, txt in enumerate(TEXTOS):
-        ids = tok(txt, return_tensors="pt", truncation=True, max_length=SEQ).to(device)
-        model(**ids)
-        if (j + 1) % 20 == 0:
-            log(f"  captura {j + 1}/{len(TEXTOS)}")
+    for j, ids in enumerate(SEQS_IDS):
+        ids_t = torch.tensor([ids], device=device)
+        model(input_ids=ids_t)
+        if (j + 1) % 50 == 0:
+            log(f"  captura {j + 1}/{len(SEQS_IDS)}")
 handle.remove()
 X = torch.cat([t.reshape(-1, HIDDEN) for t in capturados], dim=0)
 log(f"Activaciones reales: {X.shape} vectores")
@@ -257,7 +302,14 @@ log(f"tiempo total: {time.time() - t0:.0f}s")
 # Atencion, KV cache, embeddings, lm_head y el resto de capas NO se tocan.
 log("=" * 60)
 log("Inferencia: Qwen normal vs Qwen con MoE en la capa %d (mismas KV, mismas lineales)" % LAYER)
-PROMPT_GEN = "La capital de Uruguay es"
+PROMPTS = [
+    "La capital de Uruguay es",
+    "El agua hierve a una temperatura de",
+    "La fotosintesis es el proceso por el cual",
+    "Montevideo es la capital de",
+    "El idioma oficial de Espana es",
+    "La Revolucion de Mayo ocurrio en",
+]
 GEN_TOKENS = 30
 
 
@@ -268,10 +320,6 @@ def generar(modelo, prompt):
                               use_cache=True, pad_token_id=tok.eos_token_id)
     return tok.decode(out[0], skip_special_tokens=True)
 
-
-with torch.no_grad():
-    texto_normal = generar(model, PROMPT_GEN)
-log(f"[Qwen normal] {texto_normal!r}")
 
 # wrapper drop-in: misma firma que la MLP original (x -> y), sin tocar nada mas
 moe.eval()
@@ -292,15 +340,22 @@ class MoEWrapper(torch.nn.Module):
 
 
 mlp_original = model.model.layers[LAYER].mlp
-model.model.layers[LAYER].mlp = MoEWrapper(moe).to(device)
-with torch.no_grad():
-    texto_moe = generar(model, PROMPT_GEN)
-model.model.layers[LAYER].mlp = mlp_original  # restaurar
-log(f"[Qwen con MoE] {texto_moe!r}")
-iguales = texto_normal == texto_moe
-log(f"Textos iguales: {'SI' if iguales else 'NO'}")
-# PPL en un texto de eval (mismo texto, mismo modelo, solo cambia la MLP de la capa)
-TEXTO_PPL = "Montevideo es la capital de Uruguay y esta sobre el Rio de la Plata."
+comparaciones = []
+for PROMPT_GEN in PROMPTS:
+    with torch.no_grad():
+        texto_normal = generar(model, PROMPT_GEN)
+    model.model.layers[LAYER].mlp = MoEWrapper(moe).to(device)
+    with torch.no_grad():
+        texto_moe = generar(model, PROMPT_GEN)
+    model.model.layers[LAYER].mlp = mlp_original  # restaurar
+    comparaciones.append((PROMPT_GEN, texto_normal, texto_moe))
+    log(f"--- prompt: {PROMPT_GEN!r}")
+    log(f"[Qwen normal] {texto_normal!r}")
+    log(f"[Qwen con MoE] {texto_moe!r}")
+    log(f"Textos iguales: {'SI' if texto_normal == texto_moe else 'NO'}")
+# PPL en un articulo de Wikipedia NO visto en train (mismo texto, mismo modelo,
+# solo cambia la MLP de la capa)
+TEXTO_PPL = TEXTO_PPL_WIKI
 
 
 def ppl(modelo):
@@ -315,20 +370,22 @@ with torch.no_grad():
     model.model.layers[LAYER].mlp = MoEWrapper(moe).to(device)
     ppl_moe = ppl(model)
     model.model.layers[LAYER].mlp = mlp_original
-log(f"PPL normal {ppl_normal:.2f} | PPL con MoE {ppl_moe:.2f} | ratio {ppl_moe / ppl_normal:.3f}")
+log(f"PPL Wikipedia (no vista) normal {ppl_normal:.2f} | PPL con MoE {ppl_moe:.2f} | ratio {ppl_moe / ppl_normal:.3f}")
 torch.save({"state_dict": moe.state_dict(), "layer": LAYER, "inter_expert": INTER_E,
             "n_experts": N_EXPERTS, "top_k": TOP_K, "cos": cos, "r2": r2, "nmse": nmse,
-            "batch": BATCH, "seq": SEQ, "steps": STEPS, "lr": LR, "seed": SEED},
+            "batch": BATCH, "seq": SEQ, "steps": STEPS, "lr": LR, "seed": SEED,
+            "n_tokens_wiki": N_TOK, "n_articulos_wiki": N_ART},
            f"moe_destilada_qwen25_capa{LAYER}.pt")
 with open("resultados-colab-moe.md", "w") as fo:
     fo.write(f"# MoE FF{LAYER} Qwen2.5-0.5B en Colab\n\n"
+             f"- Datos: Wikipedia ES, {N_ART} articulos, {N_TOK} tokens, {len(SEQS_IDS)} seq x {SEQ}\n"
              f"- 4 expertos inter {INTER_E}, total {N_EXPERTS * 3 * INTER_E * HIDDEN:,} params = profesora\n"
              f"- Batch {BATCH} seq {SEQ}, steps {STEPS}, lr {LR}, train {n_train} vectores / eval {X_eval.shape[0]}\n"
              f"- Eval real: cos {cos:.4f}, R2 {r2:.4f}, NMSE {nmse:.4f}, lb {lb:.4f}\n"
              f"- Meta cos>={TARGET_COS} y R2>{TARGET_R2}: {'SI' if ok else 'NO'}\n\n"
-             f"## Inferencia (prompt: {PROMPT_GEN!r}, {GEN_TOKENS} tokens, greedy, misma KV)\n\n"
-             f"- Qwen normal: {texto_normal!r}\n"
-             f"- Qwen con MoE: {texto_moe!r}\n"
-             f"- Textos iguales: {'SI' if iguales else 'NO'}\n"
-             f"- PPL normal {ppl_normal:.2f} | PPL con MoE {ppl_moe:.2f} | ratio {ppl_moe / ppl_normal:.3f}\n")
+             f"## Inferencia ({GEN_TOKENS} tokens, greedy, misma KV)\n\n")
+    for pr, tn, tm in comparaciones:
+        fo.write(f"### Prompt: {pr!r}\n\n- Qwen normal: {tn!r}\n- Qwen con MoE: {tm!r}\n"
+                 f"- Textos iguales: {'SI' if tn == tm else 'NO'}\n\n")
+    fo.write(f"- PPL Wikipedia (no vista) normal {ppl_normal:.2f} | PPL con MoE {ppl_moe:.2f} | ratio {ppl_moe / ppl_normal:.3f}\n")
 log("Guardado: moe_destilada_qwen25_capa%d.pt, resultados-colab-moe.md, colab_destilar_moe.log" % LAYER)
