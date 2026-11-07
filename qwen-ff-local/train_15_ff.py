@@ -183,13 +183,13 @@ for bloque, bloque_idx in stream_wikipedia(BLOCK_SEQS, SEQ):
         X_eval, Y_eval = X[:512].clone(), Y[:512].clone()
 
     # entrenar sobre ese bloque sin retener memoria (batches barajados)
-    perm = torch.randperm(n)
+    perm = torch.randperm(n)                     # cpu
     for j in range(0, n, BATCH):
-        if len(idx_check := perm[j:j + BATCH]) == 0:
+        idx_cpu = perm[j:j + BATCH]             # indexar en CPU (X vive en cpu)
+        if len(idx_cpu) == 0:
             break
-        idx = idx_check.to(device)
-        xb = X[idx].to(device)
-        yb = Y[idx].to(device)
+        xb = X[idx_cpu].to(device).contiguous()
+        yb = Y[idx_cpu].to(device).contiguous()
         m_out, lb, f = moe(xb)
         cos_b = F.cosine_similarity(m_out, yb, dim=-1).mean()
         loss = (m_out - yb).pow(2).mean() / (yb ** 2).mean() + 0.1 * (1 - cos_b) + W_LB * lb
