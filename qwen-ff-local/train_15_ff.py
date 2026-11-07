@@ -165,12 +165,18 @@ for bloque, bloque_idx in stream_wikipedia(BLOCK_SEQS, SEQ):
                     out.detach().reshape(-1, HIDDEN).cpu().half()))
 
     handle = m_hook.register_forward_hook(hook)
+    t_start = time.time()
     for j in range(0, len(bloque), BS_FWD):
         ids_t = torch.tensor(bloque[j:j + BS_FWD], device=device)
         with torch.no_grad():
             model(input_ids=ids_t)
+        v = (j // BS_FWD + 1) * BS_FWD * SEQ
+        print(f"[capture] bloque {bloque_idx} sub {j//BS_FWD + 1}/{(len(bloque)+BS_FWD-1)//BS_FWD} vec {v}", flush=True)
         del ids_t
     handle.remove()
+    n_cap = sum(c[0].shape[0] for c in cap)
+    print(f"[capture] bloque {bloque_idx} terminado en {time.time() - t_start:.1f}s, vectores {n_cap}", flush=True)
+
 
     X = torch.cat([h[0].float() for h in cap], dim=0)
     Y = torch.cat([o[0].float() for o in cap], dim=0)
@@ -197,7 +203,7 @@ for bloque, bloque_idx in stream_wikipedia(BLOCK_SEQS, SEQ):
         loss.backward()
         opt.step()
         step += 1
-        del xb, yb, idx
+        del xb, yb, idx_cpu
     # liberar RAM del bloque
     del X, Y
     if device == "cuda":
