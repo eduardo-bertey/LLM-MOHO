@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-"""MoE D2DMoE en 3 etapas, capa 0, Qwen2.5-0.5B, solo run en Colab.
+"""MoE D2DMoE en 3 etapas, capa 4, Qwen2.5-0.5B, solo run en Colab.
+
+Defaults sin argumento: LAYER=4, CLAMP=-4, 5 expertos, top-3, 100+100 steps.
 
 Paper: Szatkowski et al., D2DMoE, arXiv:2310.04361,
 codigo https://github.com/bartwojcik/D2DMoE
@@ -12,12 +14,12 @@ Las 3 etapas, cada una con su eval contra la FF maestra original:
     Objetivo: que mas neuronas queden apagadas, sin perder cos/R2.
   ETAPA 2 - PARTE: KMeans sobre gate_proj de la FF ya escasa,
     4 expertos x 1216 neuronas, copiando los pesos de la FF escasa.
-    Router por regresion, top-2 duro.
+    Router por regresion, top-3 duro.
     Eval sin entrenar, para ver cuanto se pierde solo por partir.
   ETAPA 3 - FINE: se entrena la MoE completa (expertos + router)
-    en top-2 duro con straight-through, perdida BLD + 0.01*lb,
+    en top-3 duro con straight-through, perdida BLD + 0.01*lb,
     sobre entrada/salida de la FF maestra original.
-    Eval final top-2 contra la profesora original.
+    Eval final top-3 contra la profesora original.
 
 Todo con vectores reales: se pasan tokens de Wikipedia ES por Qwen base
 y se capturan X (entrada FF) e Y (salida profesora original).
@@ -26,8 +28,8 @@ Uso en Colab (una celda):
     !python3 colab_moe_d2dmoe.py
 
 Ajustes (variables de entorno):
-  LAYER=0  BATCH=56  SEQ=1024  STEPS1=100  STEPS3=300  LR=5e-4
-  N_TOKENS_CAPTURA=500000  CLAMP=-10  W_HOYER=0.1  SEED=123
+  Sin argumento: LAYER=4  CLAMP=-4  N_EXPERTS=5  TOPK=3  STEPS1=100  STEPS3=100
+  BATCH=56  SEQ=1024  LR=5e-4  N_TOKENS_CAPTURA=500000  W_HOYER=0.1  SEED=123
 """
 import json
 import math
@@ -36,21 +38,22 @@ import subprocess
 import sys
 import time
 
-LAYER = int(os.environ.get("LAYER", "0"))
+LAYER = int(os.environ.get("LAYER", "4"))
 BATCH = int(os.environ.get("BATCH", "56"))
 SEQ = int(os.environ.get("SEQ", "1024"))
 STEPS1 = int(os.environ.get("STEPS1", "100"))
-STEPS3 = int(os.environ.get("STEPS3", "300"))
+STEPS3 = int(os.environ.get("STEPS3", "100"))
 LR = float(os.environ.get("LR", "5e-4"))
 SEED = int(os.environ.get("SEED", "123"))
 N_TOKENS_CAPTURA = int(os.environ.get("N_TOKENS_CAPTURA", "500000"))
-CLAMP = float(os.environ.get("CLAMP", "-10"))
+CLAMP = float(os.environ.get("CLAMP", "-4"))
 W_HOYER = float(os.environ.get("W_HOYER", "0.1"))
 MICRO = int(os.environ.get("MICRO", "1024"))
 W_LB = float(os.environ.get("W_LB", "0.01"))
 MODEL_ID = "Qwen/Qwen2.5-0.5B"
 MODEL_DIR = os.environ.get("MODEL_DIR", "./modelo-qwen2.5-0.5b")
-N_EXPERTS = 4
+N_EXPERTS = int(os.environ.get("N_EXPERTS", "5"))
+TOPK = int(os.environ.get("TOPK", "3"))
 TARGET_COS, TARGET_R2 = 0.95, 0.90
 
 LOG = open("colab_moe_d2dmoe.log", "a", buffering=1)
@@ -95,6 +98,7 @@ model.eval()
 cfg = model.config
 HIDDEN, INTER, N_LAYERS = cfg.hidden_size, cfg.intermediate_size, cfg.num_hidden_layers
 INTER_E = INTER // N_EXPERTS
+EXPERT_SIZES = [INTER // N_EXPERTS + (1 if i < INTER % N_EXPERTS else 0) for i in range(N_EXPERTS)]  # ej 5 exp: [973,973,973,973,972]
 log(f"Modelo: hidden {HIDDEN}, inter {INTER}, capas {N_LAYERS}")
 
 # --- Wikipedia ES, 500k tokens ---
@@ -252,7 +256,7 @@ log(f"Etapa 1 guardada: ff_sparse_d2dmoe_capa{LAYER}_etapa1.pt | {time.time() - 
 
 # ================= ETAPA 2: PARTE =================
 log("=" * 60)
-log("ETAPA 2: PARTE, KMeans sobre gate_proj de la FF escasa, 4 expertos x 1216")
+log(f"ETAPA 2: PARTE, KMeans sobre gate_proj de la FF escasa, {N_EXPERTS} expertos {EXPERT_SIZES}")
 try:
     from sklearn.cluster import KMeans
 except ImportError:
@@ -268,7 +272,7 @@ labels_bal = np.full(INTER, -1, dtype=int)
 ocup = np.zeros(N_EXPERTS, dtype=int)
 for n_idx in order_neuronas:
     for e_idx in np.argsort(dists[n_idx]):
-        if ocup[e_idx] < INTER_E:
+        if ocup[e_idx] < EXPERT_SIZES[e_idx]:
             labels_bal[n_idx] = e_idx
             ocup[e_idx] += 1
             break
@@ -291,12 +295,12 @@ class MoE(torch.nn.Module):
             self.router.weight.mul_(0.01)
             self.router.bias.zero_()
 
-    def forward(self, x, topk=2):
+    def forward(self, x, topk=TOPK):
         orig_shape = x.shape
         x = x.reshape(-1, x.shape[-1])
         logits = self.router(x)
         probs = torch.softmax(logits, dim=-1)
-        # top-2 duro, straight-through en train: forward usa top-2, backward usa softmax
+        # top-3 duro, straight-through en train: forward usa top-3, backward usa softmax
         idx = torch.topk(probs, topk, dim=-1).indices
         w_hard = torch.zeros_like(probs).scatter_(1, idx, torch.gather(probs, 1, idx))
         w_hard = w_hard / (w_hard.sum(dim=-1, keepdim=True) + 1e-12)
@@ -319,7 +323,7 @@ log(f"MoE params totales: {sum(p.numel() for p in moe.parameters()):,}")
 
 def eval_moe(tag):
     with torch.no_grad():
-        y, lb, f = moe(X_eval.to(device), topk=2)
+        y, lb, f = moe(X_eval.to(device), topk=TOPK)
         cos = torch.nn.functional.cosine_similarity(y, Y_eval.to(device), dim=-1).mean().item()
         r2 = 1 - ((y - Y_eval.to(device)) ** 2).sum().item() / max(((Y_eval - Y_eval.mean(0)) ** 2).sum().item(), 1e-12)
         nmse = (((y - Y_eval.to(device)) ** 2).mean() / (Y_eval.to(device) ** 2).mean()).item()
@@ -327,12 +331,12 @@ def eval_moe(tag):
     return cos, r2, nmse, lb.item()
 
 
-cos2, r22, nmse2, lb2 = eval_moe("ETAPA 2, partida sin entrenar, top-2")
+cos2, r22, nmse2, lb2 = eval_moe("ETAPA 2, partida sin entrenar, top-3")
 resultados["etapa2"] = {"cos": cos2, "r2": r22, "nmse": nmse2, "lb": lb2}
 
 # ================= ETAPA 3: FINE =================
 log("=" * 60)
-log("ETAPA 3: FINE, entrenar la MoE en top-2 duro sobre entrada/salida de la FF maestra ORIGINAL")
+log("ETAPA 3: FINE, entrenar la MoE en top-3 duro sobre entrada/salida de la FF maestra ORIGINAL")
 opt3 = torch.optim.Adam(moe.parameters(), lr=LR, betas=(0.9, 0.999), eps=1e-8, weight_decay=0.0)
 t0 = time.time()
 order = torch.randperm(n_train, generator=torch.Generator().manual_seed(SEED + 1000))
@@ -351,7 +355,7 @@ for step in range(1, STEPS3 + 1):
     n_micro = (n_xb + MICRO - 1) // MICRO
     for i in range(0, n_xb, MICRO):
         x_m, y_m = xb[i:i + MICRO], yb[i:i + MICRO]
-        y_s, lb, _ = moe(x_m, topk=2)
+        y_s, lb, _ = moe(x_m, topk=TOPK)
         nmse = ((y_s - y_m) ** 2).mean() / (y_m ** 2).mean()
         cos = torch.nn.functional.cosine_similarity(y_s, y_m, dim=-1).mean()
         loss = (nmse + 0.1 * (1 - cos) + W_LB * lb) / n_micro
@@ -392,7 +396,7 @@ class MoEWrapper(torch.nn.Module):
         self.m = m
 
     def forward(self, x):
-        y, _, _ = self.m(x, topk=2)
+        y, _, _ = self.m(x, topk=TOPK)
         return y
 
 
@@ -435,8 +439,8 @@ with open("resultados-colab-moe-d2dmoe.md", "w") as fo:
              f"- Datos: Wikipedia ES, {N_ART} articulos, {N_TOK} tokens\n"
              f"- Etapa 1 sparsity clamp {CLAMP}, W_HOYER {W_HOYER}, {STEPS1} steps: "
              f"cos {cos1:.4f}, R2 {r21:.4f}, NMSE {nmse1:.4f}, gate<-10 {sp1['lt_-10']*100:.1f}%\n"
-             f"- Etapa 2 parte KMeans, sin entrenar, top-2: cos {cos2:.4f}, R2 {r22:.4f}, NMSE {nmse2:.4f}\n"
-             f"- Etapa 3 fine MoE top-2, {STEPS3} steps: cos {cos3:.4f}, R2 {r23:.4f}, NMSE {nmse3:.4f}, lb {lb3:.4f}\n"
+             f"- Etapa 2 parte KMeans, sin entrenar, top-3: cos {cos2:.4f}, R2 {r22:.4f}, NMSE {nmse2:.4f}\n"
+             f"- Etapa 3 fine MoE top-3, {STEPS3} steps: cos {cos3:.4f}, R2 {r23:.4f}, NMSE {nmse3:.4f}, lb {lb3:.4f}\n"
              f"- Meta cos>={TARGET_COS} y R2>{TARGET_R2}: {'SI' if ok else 'NO'}\n\n"
              f"## Inferencia\n\n")
     for pr, tn, tm in comparaciones:
